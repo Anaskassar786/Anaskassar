@@ -5,6 +5,19 @@ import { executeAgentBatch, SnapshotPayload } from '@/lib/execution/runner';
 import { runAdversarialDebate } from '@/lib/debate/engine';
 import { runChiefJudge } from '@/lib/judge/chief_judge';
 import { resetLlmCooldowns } from '@/lib/llm/client';
+import {
+  councilOutcome,
+  isOfflineAgent,
+  runStatusFor,
+  liveAgentCount,
+  offlineAgentCount,
+  remediationFor,
+  voteCountOf,
+  type ProviderDiagnostics,
+  type VoteCounts
+} from '@/lib/execution/offline';
+import { beginRun, budgetRemainingMs, snapshot as governorSnapshot } from '@/lib/llm/rate-limit';
+import { effectiveProviderOrder } from '@/lib/llm/models';
 import { calculatePositionSize, calculateRiskReward } from '@/lib/quant/sizing';
 import {
   AnalysisSessionRecord,
@@ -21,6 +34,7 @@ export type PipelineEvent =
   | { type: 'agent'; agentNumber: number; status: string; output?: unknown }
   | { type: 'debate'; debate: unknown }
   | { type: 'judge'; verdict: unknown }
+  | { type: 'providers'; diagnostics: ProviderDiagnostics }
   | { type: 'complete'; result: AnalysisApiResult }
   | { type: 'error'; message: string };
 
@@ -35,15 +49,18 @@ export interface AnalyzeInput {
   reuseFrozen?: boolean;
 }
 
+export type { ProviderDiagnostics };
+
 export interface AnalysisApiResult {
   success: boolean;
-  status?: 'COMPLETED' | 'DATA_UNAVAILABLE' | 'FAILED';
+  status?: 'COMPLETED' | 'PARTIAL' | 'DATA_UNAVAILABLE' | 'PROVIDER_OUTAGE' | 'FAILED';
   details?: string;
   sessionId: string;
   reusedFrozenSession?: boolean;
   timeframeMismatchWarning: boolean;
   visionMetadata: SnapshotPayload['visionMetadata'];
-  voteDistribution: { buy: number; sell: number; noTrade: number };
+  voteDistribution: VoteCounts;
+  providerDiagnostics?: ProviderDiagnostics;
   agentOutputs: unknown;
   debateResult: unknown;
   chiefJudgeVerdict: unknown;
@@ -55,6 +72,9 @@ export interface AnalysisApiResult {
 }
 
 function isReusableFrozenSession(existing: AnalysisSessionRecord): boolean {
+  // Only a fully healthy council is worth replaying. PARTIAL / PROVIDER_OUTAGE
+  // runs must stay re-runnable, otherwise a rate-limited minute permanently
+  // freezes a screenshot into a non-answer.
   if (existing.status !== 'COMPLETED') return false;
   const judge = existing.final_decision;
   if (!judge) return false;
@@ -65,9 +85,11 @@ function isReusableFrozenSession(existing: AnalysisSessionRecord): boolean {
   }
   const agents = existing.agent_analyses || [];
   if (agents.length === 0) return false;
-  const failed = agents.filter((a) => a.provider_used === 'none' || a.model_used === 'fallback').length;
-  if (failed === agents.length) return false;
-  if (failed >= 8) return false;
+  // execution_state is authoritative; the legacy provider/model check keeps
+  // older sessions on disk from being mistaken for healthy runs.
+  if (agents.some((a) => isOfflineAgent(a))) return false;
+  const failed = agents.filter((a) => a.provider_used === 'none' || a.model_used === 'fallback' || a.model_used === 'none').length;
+  if (failed > 0) return false;
   return true;
 }
 
@@ -82,7 +104,10 @@ export async function runAnalysisPipeline(
   input: AnalyzeInput,
   emit?: (event: PipelineEvent) => void
 ): Promise<AnalysisApiResult> {
+  // Fresh run: clear provider cooldowns and arm the wall-clock budget so a
+  // rate-limited key cannot strand the UI on a spinner for 10+ minutes.
   resetLlmCooldowns();
+  beginRun();
   const screenshotHash = crypto.createHash('sha256').update(input.imageBuffer).digest('hex');
 
   if (input.reuseFrozen !== false) {
@@ -97,6 +122,7 @@ export async function runAnalysisPipeline(
         timeframeMismatchWarning: existing.timeframe_mismatch_warning,
         visionMetadata: existing.vision_metadata,
         voteDistribution: existing.debate.voteSummary,
+        providerDiagnostics: existing.provider_diagnostics ?? undefined,
         agentOutputs: existing.agent_analyses,
         debateResult: existing.debate,
         chiefJudgeVerdict: existing.final_decision,
@@ -180,27 +206,44 @@ export async function runAnalysisPipeline(
     marketSnapshot.status !== 'SUCCESS' &&
     macroSnapshot.status !== 'SUCCESS' &&
     newsSnapshot.status !== 'SUCCESS';
+  const visionOffline = visionMeta.parse_state === 'OFFLINE';
   const visionFailed =
     visionMeta.detected_symbol === 'UNKNOWN' &&
     visionMeta.detected_current_price === null &&
     visionMeta.parse_confidence === 0;
 
   if (allFeedsDown && visionFailed) {
-    const details =
-      'All live data sources (market, macro, news) failed AND the screenshot could not be parsed. ' +
-      'No analysis can be produced without real data — refusing to fabricate one. Retry when at least one source recovers.';
-    record = { ...record, status: 'DATA_UNAVAILABLE', error: details };
+    const details = visionOffline
+      ? `Every live data source (market, macro, news) failed AND the vision engine never reached a model (${visionMeta.parse_error_class}). ` +
+        'Two independent outages: restore the LLM provider key/quota and the data feeds, then re-run. Nothing was fabricated in the meantime.'
+      : 'All live data sources (market, macro, news) failed AND the screenshot could not be parsed. ' +
+        'No analysis can be produced without real data — refusing to fabricate one. Retry when at least one source recovers.';
+    record = { ...record, status: visionOffline ? 'PROVIDER_OUTAGE' : 'DATA_UNAVAILABLE', error: details };
     await upsertSession(record);
 
     const result: AnalysisApiResult = {
       success: false,
-      status: 'DATA_UNAVAILABLE',
+      status: visionOffline ? 'PROVIDER_OUTAGE' : 'DATA_UNAVAILABLE',
       details,
       sessionId,
       reusedFrozenSession: false,
       timeframeMismatchWarning: false,
       visionMetadata: visionMeta,
-      voteDistribution: { buy: 0, sell: 0, noTrade: 0 },
+      voteDistribution: { buy: 0, sell: 0, noTrade: 0, offline: 0 },
+      providerDiagnostics: {
+        council_state: visionOffline ? 'OUTAGE' : 'HEALTHY',
+        live_agents: 0,
+        offline_agents: 0,
+        dominant_error_class: visionOffline ? visionMeta.parse_error_class || 'UNKNOWN' : 'NONE',
+        retry_after_ms: 0,
+        providers_tried: visionOffline ? (visionMeta.parser_provider ? [visionMeta.parser_provider] : effectiveProviderOrder()) : [],
+        skipped_agents: 10,
+        remediation: visionOffline
+          ? remediationFor((visionMeta.parse_error_class || 'UNKNOWN') as never, 0, [])
+          : ['Restore at least one market feed (Twelve Data / FRED / News) or upload a legible chart, then re-run.'],
+        run_budget_remaining_ms: Number.isFinite(budgetRemainingMs()) ? Math.round(budgetRemainingMs()) : -1,
+        governor: governorSnapshot()
+      },
       agentOutputs: [],
       debateResult: null,
       chiefJudgeVerdict: null,
@@ -229,16 +272,39 @@ export async function runAnalysisPipeline(
     userTimeframe: input.userTimeframe
   };
 
-  emit?.({ type: 'phase', phase: 2, label: 'Staggered 10-agent independent analysis' });
+  emit?.({ type: 'phase', phase: 2, label: 'Paced 10-agent independent analysis' });
 
-  const agentOutputs = await executeAgentBatch(sessionPayload, (agentNumber, status, output) => {
+  const batch = await executeAgentBatch(sessionPayload, (agentNumber, status, output) => {
     emit?.({ type: 'agent', agentNumber, status, output });
   });
+  const agentOutputs = batch.outputs;
+  const live = liveAgentCount(agentOutputs);
+  const offline = offlineAgentCount(agentOutputs);
+  const state = councilOutcome(agentOutputs.length, live);
+  const remediation =
+    state === 'HEALTHY' ? [] : remediationFor(batch.dominantErrorClass === 'NONE' ? 'UNKNOWN' : batch.dominantErrorClass, batch.retryAfterMs, batch.providersTried);
 
-  record = { ...record, agent_analyses: agentOutputs };
+  const diagnostics: ProviderDiagnostics = {
+    council_state: state,
+    live_agents: live,
+    offline_agents: offline,
+    dominant_error_class: batch.dominantErrorClass,
+    retry_after_ms: batch.retryAfterMs,
+    providers_tried: batch.providersTried,
+    skipped_agents: batch.skippedAgents,
+    remediation,
+    run_budget_remaining_ms: Number.isFinite(budgetRemainingMs()) ? Math.round(budgetRemainingMs()) : -1,
+    governor: governorSnapshot()
+  };
+  emit?.({ type: 'providers', diagnostics });
+
+  record = { ...record, agent_analyses: agentOutputs, provider_diagnostics: diagnostics };
   await upsertSession(record);
 
-  emit?.({ type: 'phase', phase: 3, label: 'Adversarial debate synthesis' });
+  // OUTAGE: no specialist reached a model. Debate and judge are still invoked —
+  // both short-circuit locally without an API call — so the session records the
+  // refusal explicitly instead of rendering a fake "final decision".
+  emit?.({ type: 'phase', phase: 3, label: state === 'OUTAGE' ? 'Debate skipped — council offline' : 'Adversarial debate synthesis' });
   const debateResult = await runAdversarialDebate(agentOutputs, effectiveSymbol);
   emit?.({ type: 'debate', debate: debateResult });
 
@@ -246,7 +312,12 @@ export async function runAnalysisPipeline(
   await upsertSession(record);
 
   emit?.({ type: 'phase', phase: 4, label: 'Chief Judge decision engine' });
-  const judgeOutput = await runChiefJudge(sessionPayload, agentOutputs, debateResult);
+  const judgeOutput = await runChiefJudge(sessionPayload, agentOutputs, debateResult, {
+    state,
+    dominantErrorClass: batch.dominantErrorClass,
+    retryAfterMs: batch.retryAfterMs,
+    remediation
+  });
 
   let positionSizingResult = null;
   const entryForSize = judgeOutput.entry.low ?? judgeOutput.entry.high;
@@ -281,22 +352,43 @@ export async function runAnalysisPipeline(
     newsSnapshot.status === 'DATA_UNAVAILABLE' &&
     visionMeta.parse_confidence === 0;
 
+  // Honest terminal state. An all-offline council is an infrastructure outage,
+  // not a NO_TRADE verdict, and a partially answered council is a degraded one —
+  // neither may be presented as a completed decision.
+  const status: AnalysisApiResult['status'] = runStatusFor({ council: state, dataUnavailable });
+
+  const details =
+    status === 'PROVIDER_OUTAGE'
+      ? `No LLM provider answered (${batch.dominantErrorClass}${batch.retryAfterMs ? `, backing off ~${Math.ceil(batch.retryAfterMs / 1000)}s` : ''}). ` +
+        `${offline}/${agentOutputs.length} specialists never reached a model${batch.skippedAgents ? `, ${batch.skippedAgents} skipped without a request to protect the remaining quota` : ''}. ` +
+        'No verdict was produced and none was fabricated. This session is not frozen — re-run the same screenshot once the provider recovers.'
+      : status === 'PARTIAL'
+        ? `Partial council: ${live}/${agentOutputs.length} specialists answered; ${offline} never reached a model. Verdict is weighted on live evidence only.`
+        : undefined;
+
+  const warnings = judgeOutput.warnings;
+  judgeOutput.warnings = [...new Set([...warnings, ...batch.batchWarnings])];
+
   record = {
     ...record,
     final_decision: judgeOutput,
     position_sizing: positionSizingResult,
-    status: dataUnavailable ? 'DATA_UNAVAILABLE' : 'COMPLETED'
+    provider_diagnostics: diagnostics,
+    status: status === 'PARTIAL' ? 'PARTIAL' : status === 'PROVIDER_OUTAGE' ? 'PROVIDER_OUTAGE' : status === 'DATA_UNAVAILABLE' ? 'DATA_UNAVAILABLE' : 'COMPLETED',
+    error: details
   };
   await upsertSession(record);
 
   const result: AnalysisApiResult = {
-    success: !dataUnavailable,
-    status: dataUnavailable ? 'DATA_UNAVAILABLE' : 'COMPLETED',
+    success: status === 'COMPLETED' || status === 'PARTIAL',
+    status,
+    details,
     sessionId,
     reusedFrozenSession: false,
     timeframeMismatchWarning: timeframeMismatch,
     visionMetadata: visionMeta,
-    voteDistribution: debateResult.voteSummary,
+    voteDistribution: voteCountOf(agentOutputs),
+    providerDiagnostics: diagnostics,
     agentOutputs,
     debateResult,
     chiefJudgeVerdict: judgeOutput,

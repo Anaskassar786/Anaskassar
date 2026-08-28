@@ -1,5 +1,5 @@
 import { VisionParserSchema, VisionParserOutput } from '@/types/analysis';
-import { chatJson } from '@/lib/llm/client';
+import { chatJson, isLlmUnavailable } from '@/lib/llm/client';
 import { asStringArray, clamp, numOrNull } from '@/lib/llm/json';
 
 const SYSTEM_PROMPT = `
@@ -77,12 +77,20 @@ function normalizeSymbol(raw: unknown): string {
   return s;
 }
 
+/**
+ * Vision is the first LLM call of a run, so it is deliberately impatient
+ * (one attempt, short wait): a rate-limited provider must be discovered in
+ * seconds, before the council spends the remaining quota. The agent runner's
+ * canary is the patient one.
+ */
 export async function parseChartScreenshot(base64Image: string, mimeType = 'image/png'): Promise<VisionParserOutput> {
   try {
-    const { data } = await chatJson<Record<string, unknown>>({
+    const { data, provider, model } = await chatJson<Record<string, unknown>>({
       json: true,
       timeoutMs: 45000,
       maxTokens: 2048,
+      attemptsPerProvider: 1,
+      patient: false,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         {
@@ -109,20 +117,36 @@ export async function parseChartScreenshot(base64Image: string, mimeType = 'imag
       visible_indicators: asStringArray(data.visible_indicators),
       chart_platform: String(data.chart_platform || 'TradingView'),
       parse_confidence: clamp(Number(data.parse_confidence) || 0, 0, 100),
-      raw_ocr_notes: String(data.raw_ocr_notes || '')
+      raw_ocr_notes: String(data.raw_ocr_notes || ''),
+      parse_state: 'LIVE',
+      parse_error_class: 'NONE',
+      parse_error: '',
+      parser_provider: provider,
+      parser_model: model
     };
 
     return VisionParserSchema.parse(parsed);
   } catch (error) {
-    console.error('Vision Parsing Error:', error);
-    return {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    const outage = isLlmUnavailable(error) ? error : null;
+    console.error('Vision Parsing Error:', message);
+    return VisionParserSchema.parse({
       detected_symbol: 'UNKNOWN',
       detected_timeframe: 'UNKNOWN',
       detected_current_price: null,
       visible_indicators: [],
       chart_platform: 'TradingView',
       parse_confidence: 0,
-      raw_ocr_notes: `Parsing failed: ${error instanceof Error ? error.message : 'Unknown error'}`
-    };
+      // Honest split: OFFLINE = no model answered; NO_TEXT = a model looked and
+      // could not read the chart. The pipeline treats these completely differently.
+      parse_state: outage ? 'OFFLINE' : 'NO_TEXT',
+      parse_error_class: outage ? outage.errorClass : 'EMPTY',
+      parse_error: message.slice(0, 600),
+      raw_ocr_notes: outage
+        ? `Vision engine offline: ${message}`.slice(0, 600)
+        : `Chart produced no readable metadata: ${message}`.slice(0, 600),
+      parser_provider: '',
+      parser_model: ''
+    });
   }
 }

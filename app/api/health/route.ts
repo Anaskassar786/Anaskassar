@@ -3,7 +3,16 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fetchFredMacroData, fetchMarketNews, fetchTwelveData } from '@/lib/data/ingestion';
 import { appendHealthLog, listHealthLogs } from '@/lib/db/store';
-import { modelsFor, providerOrder } from '@/lib/llm/models';
+import {
+  configuredProviders,
+  effectiveProviderOrder,
+  modelsFor,
+  providerHasKey,
+  providerKeyEnv,
+  providerOrder
+} from '@/lib/llm/models';
+import { outageInfo, runBudgetMs, snapshot as governorSnapshot } from '@/lib/llm/rate-limit';
+import { probeProvider } from '@/lib/llm/client';
 
 export const dynamic = 'force-dynamic';
 
@@ -51,8 +60,10 @@ function missingKeyProbe(name: string): Probe {
   };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const searchParams = new URL(req.url).searchParams;
   const started = Date.now();
+  const probesExtra: Probe[] = [];
 
   // --- Data feeds: real cheap calls ---
   const [market, macro, news] = await Promise.all([
@@ -128,9 +139,56 @@ export async function GET() {
     };
   }
 
+  // --- Council capacity: what the governor is currently allowing ---
+  const order = effectiveProviderOrder();
+  const gov = governorSnapshot();
+  const llm = {
+    preferred_order: providerOrder(),
+    effective_order: order,
+    failover: (process.env.LLM_FAILOVER || 'on').toLowerCase() !== 'off',
+    key_configured: {
+      openrouter: providerHasKey('openrouter'),
+      nvidia: providerHasKey('nvidia'),
+      gemini: providerHasKey('gemini')
+    },
+    providers_with_keys: configuredProviders(),
+    pacing: {
+      min_interval_ms: Number(process.env.LLM_MIN_INTERVAL_MS || 900),
+      max_concurrency: Number(process.env.LLM_MAX_CONCURRENCY || 1),
+      max_attempts: Number(process.env.LLM_MAX_ATTEMPTS || 3),
+      max_wait_ms: Number(process.env.LLM_MAX_WAIT_MS || 90000),
+      run_budget_ms: runBudgetMs(),
+      image_max_bytes: Number(process.env.LLM_IMAGE_MAX_BYTES || 1500000)
+    },
+    governor: gov,
+    outage: outageInfo(),
+    single_provider_risk:
+      order.length === 1
+        ? `Only ${order[0]} is reachable. A 429 on ${providerKeyEnv(order[0] as 'nvidia')} therefore stops vision, all 10 specialists, the debate and the judge at once. Add OPENROUTER_API_KEY or GEMINI_API_KEY (failover is on) or set LLM_PROVIDER_ORDER=${order[0]},openrouter,gemini.`
+        : null
+  };
+
   const probes = [...dataProbes, openrouter, nvidia, gemini, storeProbe];
 
-  for (const p of probes) {
+  // `?probe=1` additionally spends 1 completion token per provider, which is the
+  // only way to tell "key is valid" from "key is valid but rate limited right now".
+  if (searchParams.get('probe') === '1') {
+    const live = await Promise.all(
+      configuredProviders().map(async (p) => {
+        const res = await probeProvider(p);
+        return {
+          provider_name: `${p} (1-token probe)`,
+          endpoint_tested: `POST chat/completions ${res.model}`,
+          status: res.ok ? ('PASS' as const) : ('FAIL' as const),
+          latency_ms: Date.now() - started,
+          error_message: res.message
+        } satisfies Probe;
+      })
+    );
+    probesExtra.push(...live);
+  }
+
+  for (const p of [...probes, ...probesExtra]) {
     await appendHealthLog(p);
   }
 
@@ -140,14 +198,15 @@ export async function GET() {
   return NextResponse.json({
     mode: 'NO-FAKE-DATA STRICT',
     execution: 'DISABLED',
-    overall: fails === 0 ? 'READY' : 'DEGRADED',
+    overall: fails === 0 && order.length > 0 ? 'READY' : 'DEGRADED',
     models: {
-      order: providerOrder(),
+      order,
       nvidia: modelsFor('nvidia'),
       openrouter: modelsFor('openrouter'),
       gemini: modelsFor('gemini')
     },
-    probes,
+    llm,
+    probes: [...probes, ...probesExtra],
     history: history.slice(0, 20)
   });
 }

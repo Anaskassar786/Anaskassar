@@ -2,6 +2,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import type { AgentOutput, ChiefJudgeOutput, TradeOutcome, VisionParserOutput } from '@/types/analysis';
 import type { DebateResult } from '@/lib/debate/engine';
+import type { ProviderDiagnostics } from '@/lib/execution/offline';
 import type { MacroDataSnapshot, MarketDataSnapshot, NewsDataSnapshot } from '@/lib/data/ingestion';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -10,7 +11,15 @@ const SCREENSHOTS_DIR = path.join(DATA_DIR, 'screenshots');
 const INDEX_FILE = path.join(DATA_DIR, 'index.json');
 const HEALTH_FILE = path.join(DATA_DIR, 'health.json');
 
-export type SessionStatus = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'DATA_UNAVAILABLE';
+export type SessionStatus =
+  | 'RUNNING'
+  | 'COMPLETED'
+  /** Some specialists answered, others never reached a model. */
+  | 'PARTIAL'
+  | 'FAILED'
+  | 'DATA_UNAVAILABLE'
+  /** No LLM provider answered at all — no verdict exists, nothing was judged. */
+  | 'PROVIDER_OUTAGE';
 
 export interface StoredAgent extends AgentOutput {
   provider_used: string;
@@ -38,7 +47,9 @@ export interface AnalysisSessionRecord {
   status: SessionStatus;
   agent_analyses: StoredAgent[];
   debate: DebateResult | null;
-  final_decision: (ChiefJudgeOutput & { chief_judge_model?: string }) | null;
+  final_decision: (ChiefJudgeOutput & { chief_judge_model?: string; provider_used?: string }) | null;
+  /** What the LLM governor saw during this run (rate limits, breaker, budget). */
+  provider_diagnostics?: ProviderDiagnostics | null;
   position_sizing: {
     positionSizeLots: number | null;
     slDistancePips: number;

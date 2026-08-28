@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { downscaleImage } from '@/lib/image/downscale';
 import {
   Activity,
   AlertTriangle,
@@ -18,7 +19,11 @@ import {
 } from 'lucide-react';
 
 type Decision = 'BUY' | 'SELL' | 'NO_TRADE';
-type AgentStatus = 'IDLE' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+/**
+ * OFFLINE = no model ever answered for that specialist (provider outage / rate
+ * limit) — it is not a vote. SKIPPED_* = never sent, to preserve quota.
+ */
+type AgentStatus = 'IDLE' | 'RUNNING' | 'COMPLETED' | 'OFFLINE' | 'SKIPPED_OUTAGE' | 'SKIPPED_BUDGET' | 'FAILED';
 
 interface AgentOutput {
   agent_number: number;
@@ -39,6 +44,10 @@ interface AgentOutput {
   warnings: string[];
   provider_used?: string;
   model_used?: string;
+  execution_state?: 'LIVE' | 'OFFLINE';
+  error_class?: string;
+  attempts?: number;
+  retry_after_ms?: number;
 }
 
 interface AnalysisResult {
@@ -57,12 +66,31 @@ interface AnalysisResult {
     chart_platform: string;
     parse_confidence: number;
     raw_ocr_notes: string;
+    /** LIVE = model answered · OFFLINE = no provider answered · NO_TEXT = nothing legible. */
+    parse_state?: 'LIVE' | 'OFFLINE' | 'NO_TEXT';
+    parse_error_class?: string;
+    parse_error?: string;
+    parser_provider?: string;
+    parser_model?: string;
     candle_ohlc?: { open: number | null; high: number | null; low: number | null; close: number | null };
   };
-  voteDistribution: { buy: number; sell: number; noTrade: number };
+  voteDistribution: { buy: number; sell: number; noTrade: number; offline?: number };
+  providerDiagnostics?: {
+    council_state: 'HEALTHY' | 'DEGRADED' | 'OUTAGE';
+    live_agents: number;
+    offline_agents: number;
+    dominant_error_class: string;
+    retry_after_ms: number;
+    providers_tried: string[];
+    skipped_agents: number;
+    remediation: string[];
+    run_budget_remaining_ms?: number;
+  };
   agentOutputs: AgentOutput[];
   debateResult: {
-    voteSummary: { buy: number; sell: number; noTrade: number };
+    voteSummary: { buy: number; sell: number; noTrade: number; offline?: number };
+    liveAgents?: number;
+    offlineAgents?: number;
     topBullishClaim: { agent: string; claim: string };
     topBearishClaim: { agent: string; claim: string };
     bullCounterargument: string;
@@ -141,6 +169,7 @@ function decisionTone(d?: string) {
 function toneClasses(tone: string) {
   if (tone === 'buy') return 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300';
   if (tone === 'sell') return 'bg-rose-950/40 border-rose-500/40 text-rose-300';
+  if (tone === 'offline') return 'bg-slate-900 border-slate-700 text-slate-400';
   return 'bg-amber-950/40 border-amber-500/40 text-amber-300';
 }
 
@@ -159,7 +188,7 @@ export default function TradingTerminal() {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clock, setClock] = useState('');
-  const [health, setHealth] = useState<{ ready: boolean; label: string }>({ ready: false, label: 'CHECKING' });
+  const [health, setHealth] = useState<{ ready: boolean; label: string; risk?: string | null }>({ ready: false, label: 'CHECKING' });
   const [sessions, setSessions] = useState<SessionIndexItem[]>([]);
   const [expandedAgent, setExpandedAgent] = useState<number | null>(1);
   const [outcomeForm, setOutcomeForm] = useState({
@@ -170,6 +199,7 @@ export default function TradingTerminal() {
     notes: ''
   });
   const [outcomeMsg, setOutcomeMsg] = useState('');
+  const [uploadNote, setUploadNote] = useState('');
 
   useEffect(() => {
     const tick = () =>
@@ -207,12 +237,14 @@ export default function TradingTerminal() {
       .then((data) => {
         const probes: { status: string }[] = data.probes || [];
         const fails = probes.filter((p) => p.status === 'FAIL').length;
+        const order: string[] = data.models?.order || [];
         setHealth({
           ready: fails === 0,
-          label: fails === 0 ? `APIs: READY (${probes.length}/${probes.length})` : `APIs: DEGRADED (${probes.length - fails}/${probes.length})`
+          label: `${fails === 0 ? `APIs: READY (${probes.length}/${probes.length})` : `APIs: DEGRADED (${probes.length - fails}/${probes.length})`} · LLM: ${order.join(' → ') || 'none'}`,
+          risk: data.llm?.single_provider_risk || null
         });
       })
-      .catch(() => setHealth({ ready: false, label: 'APIs: UNREACHABLE' }));
+      .catch(() => setHealth({ ready: false, label: 'APIs: UNREACHABLE', risk: null }));
   }, [loadSessions]);
 
   useEffect(() => {
@@ -246,10 +278,20 @@ export default function TradingTerminal() {
         const event = JSON.parse(line);
         if (event.type === 'phase') setPhaseLabel(`PHASE ${event.phase}: ${event.label}`);
         if (event.type === 'agent') {
+          const map: Record<string, AgentStatus> = {
+            RUNNING: 'RUNNING',
+            COMPLETED: 'COMPLETED',
+            OFFLINE: 'OFFLINE',
+            SKIPPED_OUTAGE: 'SKIPPED_OUTAGE',
+            SKIPPED_BUDGET: 'SKIPPED_BUDGET'
+          };
           setAgentStatus((prev) => ({
             ...prev,
-            [event.agentNumber]: event.status === 'COMPLETED' ? 'COMPLETED' : 'RUNNING'
+            [event.agentNumber]: map[event.status] || (event.status === 'COMPLETED' ? 'COMPLETED' : 'RUNNING')
           }));
+        }
+        if (event.type === 'providers' && event.diagnostics?.council_state === 'OUTAGE') {
+          setPhaseLabel('COUNCIL OFFLINE — no request budget was wasted on the remaining specialists');
         }
         if (event.type === 'complete') {
           setResult(event.result);
@@ -273,8 +315,23 @@ export default function TradingTerminal() {
     setPhaseLabel('PHASE 0: Queuing vision engine');
     setAgentStatus(Object.fromEntries(Array.from({ length: 10 }, (_, i) => [i + 1, 'IDLE'])) as Record<number, AgentStatus>);
 
+    // Downscale in the browser first: an untouched 4 MB PNG is ~30k vision tokens
+    // per call and is the fastest way to trip a provider 429 before the council
+    // even starts.
+    let payload: File | Blob = file;
+    let payloadName = file.name || 'chart.png';
+    try {
+      setPhaseLabel('PHASE 0: Preparing screenshot');
+      const prepared = await downscaleImage(file, file.name || 'chart.png');
+      payload = prepared.blob;
+      payloadName = prepared.name;
+      setUploadNote(prepared.note);
+    } catch {
+      setUploadNote('Screenshot sent as uploaded (downscale unavailable in this browser).');
+    }
+
     const formData = new FormData();
-    formData.append('screenshot', file);
+    formData.append('screenshot', payload, payloadName);
     formData.append('symbol', symbol);
     formData.append('timeframe', timeframe);
     formData.append('riskAmount', riskAmount);
@@ -344,6 +401,10 @@ export default function TradingTerminal() {
   };
 
   const verdictTone = decisionTone(result?.chiefJudgeVerdict?.final_decision);
+  const diag = result?.providerDiagnostics;
+  const councilOutage = result?.status === 'PROVIDER_OUTAGE' || diag?.council_state === 'OUTAGE';
+  const councilDegraded = diag?.council_state === 'DEGRADED';
+  const offlineVotes = result?.voteDistribution?.offline ?? diag?.offline_agents ?? 0;
   const completedAgents = useMemo(
     () => Object.values(agentStatus).filter((s) => s === 'COMPLETED').length,
     [agentStatus]
@@ -374,6 +435,14 @@ export default function TradingTerminal() {
           <span className="bg-slate-900 border border-amber-900/50 px-3 py-1.5 rounded-full text-amber-300">
             MODE: NO-FAKE-DATA STRICT
           </span>
+          {health.risk && (
+            <span
+              title={health.risk}
+              className="bg-rose-950/40 border border-rose-800 px-3 py-1.5 rounded-full text-rose-300 cursor-help"
+            >
+              SINGLE PROVIDER RISK
+            </span>
+          )}
           <span className="bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-full text-slate-400">
             EXECUTION: DISABLED
           </span>
@@ -395,6 +464,7 @@ export default function TradingTerminal() {
                   onChange={(e) => setFile(e.target.files?.[0] || null)}
                   className="w-full text-xs text-slate-300 bg-slate-950 border border-slate-800 rounded-lg p-2 focus:outline-none focus:border-emerald-500"
                 />
+                {uploadNote && <p className="text-[10px] text-slate-500 mt-1">{uploadNote}</p>}
                 {preview ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={preview} alt="Chart preview" className="mt-3 w-full rounded-lg border border-slate-800 max-h-48 object-cover" />
@@ -479,24 +549,29 @@ export default function TradingTerminal() {
                   {Array.from({ length: 10 }, (_, i) => {
                     const n = i + 1;
                     const st = agentStatus[n] || 'IDLE';
+                    const dead = st === 'OFFLINE' || st === 'SKIPPED_OUTAGE' || st === 'SKIPPED_BUDGET';
                     return (
                       <div
                         key={n}
+                        title={`A${n} · ${st}`}
                         className={`text-[10px] text-center rounded py-1.5 border ${
                           st === 'COMPLETED'
                             ? 'border-emerald-700 bg-emerald-950/50 text-emerald-300'
                             : st === 'RUNNING'
                               ? 'border-amber-700 bg-amber-950/40 text-amber-300'
-                              : 'border-slate-800 text-slate-600'
+                              : dead
+                                ? 'border-rose-900 bg-rose-950/30 text-rose-300'
+                                : 'border-slate-800 text-slate-600'
                         }`}
                       >
                         A{n}
+                        {dead ? <span className="block text-[8px] tracking-tight">{st === 'OFFLINE' ? 'offline' : 'not sent'}</span> : null}
                       </div>
                     );
                   })}
                 </div>
                 <p className="text-[10px] text-slate-500">
-                  Staggered queue: 2 agents / batch · 3s delay · {completedAgents}/10 complete
+                  Serial queue with shared rate governor · {completedAgents}/10 answered · a provider that fails twice in a row stops the remaining requests instead of burning the quota
                 </p>
               </div>
             )}
@@ -518,8 +593,19 @@ export default function TradingTerminal() {
                     <span className="text-slate-200">
                       {s.detected_symbol || s.user_symbol} · {s.user_timeframe}
                     </span>
-                    <span className={s.final_decision === 'BUY' ? 'text-emerald-400' : s.final_decision === 'SELL' ? 'text-rose-400' : 'text-amber-400'}>
-                      {s.final_decision || s.status}
+                    <span
+                      className={
+                        s.status === 'PROVIDER_OUTAGE'
+                          ? 'text-slate-500'
+                          : s.final_decision === 'BUY'
+                            ? 'text-emerald-400'
+                            : s.final_decision === 'SELL'
+                              ? 'text-rose-400'
+                              : 'text-amber-400'
+                      }
+                    >
+                      {/* An outage is not a verdict — never show its stored NO_TRADE as if it were one. */}
+                      {s.status === 'PROVIDER_OUTAGE' ? 'NO VERDICT (OFFLINE)' : s.final_decision || s.status}
                     </span>
                   </div>
                   <div className="text-slate-500 mt-0.5">{new Date(s.created_at).toISOString().replace('T', ' ').slice(0, 19)} UTC</div>
@@ -552,13 +638,60 @@ export default function TradingTerminal() {
                 <Banner tone="sell">
                   {result.status === 'DATA_UNAVAILABLE'
                     ? 'DATA_UNAVAILABLE — '
-                    : 'SESSION FAILED — '}
+                    : result.status === 'PROVIDER_OUTAGE'
+                      ? 'PROVIDER_OUTAGE — '
+                      : 'SESSION FAILED — '}
                   {result.details || result.error || 'No verdict was produced. The terminal never fabricates an analysis; retry when at least one data source is reachable.'}
+                </Banner>
+              )}
+
+              {councilOutage && result.chiefJudgeVerdict && (
+                <section className="border border-rose-500/50 bg-rose-950/30 rounded-2xl p-6">
+                  <div className="flex items-start justify-between gap-4 flex-wrap">
+                    <div>
+                      <span className="text-[11px] uppercase tracking-[0.25em] text-rose-300">No verdict — infrastructure failure</span>
+                      <h2 className="text-4xl font-black mt-1 tracking-tight text-rose-200">COUNCIL OFFLINE</h2>
+                      <p className="text-xs text-rose-100/80 mt-3 max-w-3xl leading-relaxed">
+                        {result.chiefJudgeVerdict?.decision_summary}
+                      </p>
+                    </div>
+                    <div className="text-right text-[10px] text-rose-200/80 space-y-1">
+                      <div>LIVE AGENTS: {diag?.live_agents ?? 0}/10</div>
+                      <div>OFFLINE: {diag?.offline_agents ?? offlineVotes}/10</div>
+                      <div>ERROR: {diag?.dominant_error_class || 'UNKNOWN'}</div>
+                      {diag?.retry_after_ms ? <div>RETRY IN: ~{Math.ceil(diag.retry_after_ms / 1000)}s</div> : null}
+                      {diag?.skipped_agents ? <div>REQUESTS SAVED: {diag.skipped_agents}</div> : null}
+                    </div>
+                  </div>
+                  {!!diag?.remediation?.length && (
+                    <div className="mt-4 border-t border-rose-900/60 pt-3">
+                      <div className="text-[10px] uppercase tracking-widest text-rose-300 mb-1">How to fix this</div>
+                      <ul className="list-disc pl-4 space-y-1 text-[11px] text-rose-100/90">
+                        {diag.remediation.map((r: string) => (
+                          <li key={r.slice(0, 40)}>{r}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <p className="text-[10px] text-rose-200/60 mt-3">
+                    This run was NOT frozen for replay, so the same screenshot can be re-analysed the moment a provider answers.
+                  </p>
+                </section>
+              )}
+
+              {councilDegraded && (
+                <Banner tone="hold">
+                  PARTIAL COUNCIL — {diag?.live_agents}/10 specialists answered; {diag?.offline_agents} never reached a model ({diag?.dominant_error_class}).
+                  The verdict below is judged on live evidence only; offline agents were not counted as votes.
                 </Banner>
               )}
 
               {result.chiefJudgeVerdict && (
               <>
+              {/* During an outage the "final decision" card is suppressed entirely:
+                  the COUNCIL OFFLINE panel above replaces it, and the evidence,
+                  votes and agent cards below stay visible so the failure is auditable. */}
+              {!councilOutage && (
               <section className={`relative overflow-hidden border rounded-2xl p-6 ${toneClasses(verdictTone)}`}>
                 <div className="flex justify-between items-start gap-4 flex-wrap">
                   <div>
@@ -602,14 +735,16 @@ export default function TradingTerminal() {
                   <Metric label="Vision Px" value={fmt(result.visionMetadata.detected_current_price, 3)} />
                 </div>
               </section>
+              )}
 
               <section className="bg-slate-950/80 border border-slate-800 rounded-2xl p-5">
                 <h3 className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest mb-1">Agent Council Distribution</h3>
                 <p className="text-[10px] text-slate-500 mb-4">Exact specialist vote counts only. Never interpreted as probability of profit.</p>
-                <div className="grid grid-cols-3 gap-3 text-center text-xs">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center text-xs">
                   <VoteBox label="BUY VOTES" value={result.voteDistribution.buy} tone="buy" />
                   <VoteBox label="SELL VOTES" value={result.voteDistribution.sell} tone="sell" />
-                  <VoteBox label="NO TRADE" value={result.voteDistribution.noTrade} tone="hold" />
+                  <VoteBox label="NO TRADE (LIVE ONLY)" value={result.voteDistribution.noTrade} tone="hold" />
+                  <VoteBox label="OFFLINE — NOT VOTES" value={result.voteDistribution.offline ?? 0} tone="offline" />
                 </div>
               </section>
 
@@ -648,7 +783,8 @@ export default function TradingTerminal() {
                 <div className="space-y-2">
                   {(result.agentOutputs || []).map((agent) => {
                     const open = expandedAgent === agent.agent_number;
-                    const tone = decisionTone(agent.decision);
+                    const agentOffline = agent.execution_state === 'OFFLINE' || agent.model_used === 'none' || agent.model_used === 'skipped' || agent.provider_used === 'none';
+                    const tone = agentOffline ? 'offline' : decisionTone(agent.decision);
                     return (
                       <div key={agent.agent_number} className="border border-slate-800 rounded-xl overflow-hidden">
                         <button
@@ -660,8 +796,10 @@ export default function TradingTerminal() {
                             {agent.agent_name}{' '}
                             <span className="text-slate-500">· {AGENT_NAMES[agent.agent_number - 1]}</span>
                           </span>
-                          <span className={`px-2 py-0.5 rounded border text-[10px] ${toneClasses(tone)}`}>{agent.decision}</span>
-                          <span className="text-slate-400 w-16 text-right">{agent.confidence}/100</span>
+                          <span className={`px-2 py-0.5 rounded border text-[10px] ${toneClasses(tone)}`}>
+                            {agentOffline ? (agent.model_used === 'skipped' ? 'NOT SENT' : 'OFFLINE') : agent.decision}
+                          </span>
+                          <span className="text-slate-400 w-16 text-right">{agentOffline ? '—' : `${agent.confidence}/100`}</span>
                           <ChevronDown size={14} className={`text-slate-500 transition ${open ? 'rotate-180' : ''}`} />
                         </button>
                         {open && (
@@ -669,6 +807,8 @@ export default function TradingTerminal() {
                             <div className="text-slate-500">
                               data_quality={agent.data_quality}
                               {agent.provider_used ? ` · ${agent.provider_used}/${agent.model_used}` : ''}
+                              {agentOffline && agent.error_class && agent.error_class !== 'NONE' ? ` · error=${agent.error_class}` : ''}
+                              {agentOffline && agent.retry_after_ms ? ` · backoff=${Math.ceil(agent.retry_after_ms / 1000)}s` : ''}
                             </div>
                             <List label="Evidence" items={agent.evidence} />
                             <List label="Supporting" items={agent.supporting_factors} />
@@ -730,6 +870,14 @@ export default function TradingTerminal() {
                 <p>
                   {result.visionMetadata.detected_symbol} · {result.visionMetadata.detected_timeframe} · parse {result.visionMetadata.parse_confidence}/100 · {result.visionMetadata.chart_platform}
                 </p>
+                <p className={result.visionMetadata.parse_state === 'OFFLINE' ? 'text-rose-300' : 'text-slate-500'}>
+                  vision parser:{' '}
+                  {result.visionMetadata.parse_state === 'OFFLINE'
+                    ? `OFFLINE (${result.visionMetadata.parse_error_class}) — the model never answered, this is not a reading of the chart`
+                    : result.visionMetadata.parse_state === 'NO_TEXT'
+                      ? 'NO_TEXT — a model read the chart and found nothing legible'
+                      : `LIVE · ${result.visionMetadata.parser_provider}/${result.visionMetadata.parser_model}`}
+                </p>
                 <p className="text-slate-500">{result.visionMetadata.raw_ocr_notes}</p>
                 {result.visionMetadata.visible_indicators?.length > 0 && (
                   <p>Indicators: {result.visionMetadata.visible_indicators.join(', ')}</p>
@@ -743,6 +891,39 @@ export default function TradingTerminal() {
                     <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}
                   </p>
                 ))}
+                {result.providerDiagnostics && (
+                  <div className="pt-2 border-t border-slate-800">
+                    <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Council capacity</div>
+                    <div className="flex flex-wrap gap-1.5 text-[10px]">
+                      <span className="px-2 py-0.5 rounded border border-slate-700 text-slate-300">
+                        state={result.providerDiagnostics.council_state}
+                      </span>
+                      <span className="px-2 py-0.5 rounded border border-slate-700 text-slate-300">
+                        live {result.providerDiagnostics.live_agents}/10
+                      </span>
+                      {result.providerDiagnostics.offline_agents > 0 && (
+                        <span className="px-2 py-0.5 rounded border border-rose-800 text-rose-300">
+                          offline {result.providerDiagnostics.offline_agents}
+                        </span>
+                      )}
+                      {result.providerDiagnostics.skipped_agents > 0 && (
+                        <span className="px-2 py-0.5 rounded border border-slate-700 text-slate-300">
+                          {result.providerDiagnostics.skipped_agents} requests saved
+                        </span>
+                      )}
+                      {result.providerDiagnostics.providers_tried.map((pr: string) => (
+                        <span key={pr} className="px-2 py-0.5 rounded border border-slate-700 text-slate-400">
+                          {pr}
+                        </span>
+                      ))}
+                      {result.providerDiagnostics.run_budget_remaining_ms != null && result.providerDiagnostics.run_budget_remaining_ms >= 0 && (
+                        <span className="px-2 py-0.5 rounded border border-slate-700 text-slate-400">
+                          run budget left {(result.providerDiagnostics.run_budget_remaining_ms / 1000).toFixed(0)}s
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <div className="grid md:grid-cols-2 gap-3 pt-2">
                   <List label="Strongest bullish" items={result.chiefJudgeVerdict?.strongest_bullish_arguments} />
                   <List label="Strongest bearish" items={result.chiefJudgeVerdict?.strongest_bearish_arguments} />

@@ -37,6 +37,7 @@ next-env.d.ts
 
 # local test fixtures
 /test-charts/
+/.tsc-test
 
 # runtime session store (keep the folder, ignore contents)
 data/*

@@ -34,7 +34,7 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 | Variable | Used by | If missing |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Phase 0 vision (primary), 10 agents, debate — OpenRouter/Gemini | Fallback providers are tried automatically; if all LLM providers fail, agents return explicit `NO_TRADE` / `INSUFFICIENT` and the judge fails honestly |
-| `GEMINI_API_KEY` (+ `_DEFAULT_MODEL`) | Vision fallback + LLM failover (native Gemini API) | Vision falls back to OpenRouter only |
+| `GEMINI_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Vision fallback + LLM failover (native Gemini API) | Vision falls back to OpenRouter only |
 | `NVIDIA_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Chief Judge (MiniMax via NVIDIA OpenAI-compatible endpoint) | Judge falls back to OpenRouter/Gemini per provider chain |
 | `MINIMAX_API_KEY` / `MINIMAX_DEFAULT_MODEL` | Reserved (MiniMax is currently routed via NVIDIA) | Unused |
 | `TWELVE_DATA_API_KEY` (+ `_BASE_URL`) | Market candles (Phase 1 freeze) | `DATA_UNAVAILABLE` market feed |

@@ -101,7 +101,10 @@ export async function GET() {
         )
       : Promise.resolve(missingKeyProbe('NVIDIA')),
     process.env.GEMINI_API_KEY
-      ? probeModelsEndpoint('Gemini', `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`)
+      ? probeModelsEndpoint(
+          'Gemini',
+          `${(process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/$/, '')}/models?key=${process.env.GEMINI_API_KEY}`
+        )
       : Promise.resolve(missingKeyProbe('GEMINI'))
   ]);
 

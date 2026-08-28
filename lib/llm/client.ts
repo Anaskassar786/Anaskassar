@@ -133,7 +133,7 @@ async function callGemini(opts: ChatRequest): Promise<string> {
     parts.push({ inline_data: { mime_type: image.mime, data: image.data } });
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const url = `${env('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta')}/models/${model}:generateContent?key=${apiKey}`;
   const res = await fetchWithTimeout(
     url,
     {

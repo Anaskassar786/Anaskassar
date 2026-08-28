@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": false,
+    "declaration": false,
+    "sourceMap": false,
+    "outDir": ".tsc-test",
+    "rootDir": ".",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "ES2022",
+    "jsx": "react-jsx",
+    "incremental": false,
+    "plugins": []
+  },
+  "include": ["tests/**/*.ts", "lib/**/*.ts", "types/**/*.ts"],
+  "exclude": ["node_modules", ".next", "app", "components"]
+}

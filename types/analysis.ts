@@ -18,7 +18,17 @@ export const VisionParserSchema = z.object({
   visible_indicators: z.array(z.string()),
   chart_platform: z.string().default('TradingView'),
   parse_confidence: z.number().min(0).max(100),
-  raw_ocr_notes: z.string()
+  raw_ocr_notes: z.string(),
+  /**
+   * Distinguishes "the chart had nothing readable on it" from "the vision model
+   * never answered" — the first is a data problem, the second is an outage, and
+   * conflating them is what made a 429 look like a deliberate NO_TRADE.
+   */
+  parse_state: z.enum(['LIVE', 'OFFLINE', 'NO_TEXT']).default('LIVE'),
+  parse_error_class: z.string().default('NONE'),
+  parse_error: z.string().default(''),
+  parser_provider: z.string().default(''),
+  parser_model: z.string().default('')
 });
 export type VisionParserOutput = z.infer<typeof VisionParserSchema>;
 
@@ -41,7 +51,31 @@ export const AgentOutputSchema = z.object({
   risk_reward: z.number().nullable(),
   invalidation_conditions: z.array(z.string()),
   data_quality: z.enum(['HIGH', 'MEDIUM', 'LOW', 'INSUFFICIENT']),
-  warnings: z.array(z.string())
+  warnings: z.array(z.string()),
+  /**
+   * LIVE = the specialist actually answered. OFFLINE = no model ever replied
+   * (rate limit, dead key, timeout). A NO_TRADE from an OFFLINE agent is not a
+   * vote, and the terminal renders it as such.
+   */
+  execution_state: z.enum(['LIVE', 'OFFLINE']).default('LIVE'),
+  error_class: z
+    .enum([
+      'RATE_LIMIT',
+      'CREDITS',
+      'AUTH',
+      'MISSING_KEY',
+      'MODEL_NOT_FOUND',
+      'TIMEOUT',
+      'NETWORK',
+      'UPSTREAM',
+      'EMPTY',
+      'CLIENT',
+      'UNKNOWN',
+      'NONE'
+    ])
+    .default('NONE'),
+  attempts: z.number().int().min(0).default(1),
+  retry_after_ms: z.number().min(0).default(0)
 });
 export type AgentOutput = z.infer<typeof AgentOutputSchema>;
 
@@ -72,7 +106,18 @@ export const ChiefJudgeOutputSchema = z.object({
   rejected_arguments: z.array(z.string()),
   invalidation_conditions: z.array(z.string()),
   warnings: z.array(z.string()),
-  data_quality: z.enum(['HIGH', 'MEDIUM', 'LOW', 'INSUFFICIENT'])
+  data_quality: z.enum(['HIGH', 'MEDIUM', 'LOW', 'INSUFFICIENT']),
+  /**
+   * Deterministic, locally computed council-health fields. They are never
+   * model-generated: they tell the operator whether the verdict below is a real
+   * deliberation or a refusal because the council could not run.
+   */
+  council_state: z.enum(['HEALTHY', 'DEGRADED', 'OUTAGE']).default('HEALTHY'),
+  live_agents: z.number().int().min(0).default(10),
+  offline_agents: z.number().int().min(0).default(0),
+  provider_error_class: z.string().default('NONE'),
+  retry_after_ms: z.number().min(0).default(0),
+  remediation: z.array(z.string()).default([])
 });
 export type ChiefJudgeOutput = z.infer<typeof ChiefJudgeOutputSchema>;
 

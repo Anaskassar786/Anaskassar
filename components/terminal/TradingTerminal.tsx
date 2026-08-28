@@ -43,6 +43,9 @@ interface AgentOutput {
 
 interface AnalysisResult {
   success: boolean;
+  status?: string;
+  details?: string;
+  error?: string;
   sessionId: string;
   reusedFrozenSession?: boolean;
   timeframeMismatchWarning: boolean;
@@ -201,10 +204,11 @@ export default function TradingTerminal() {
     fetch('/api/health')
       .then((r) => r.json())
       .then((data) => {
-        const fails = (data.probes || []).filter((p: { status: string }) => p.status === 'FAIL').length;
+        const probes: { status: string }[] = data.probes || [];
+        const fails = probes.filter((p) => p.status === 'FAIL').length;
         setHealth({
-          ready: fails < 5,
-          label: fails === 0 ? 'APIs: READY' : `APIs: ${fails} DEGRADED`
+          ready: fails === 0,
+          label: fails === 0 ? `APIs: READY (${probes.length}/${probes.length})` : `APIs: DEGRADED (${probes.length - fails}/${probes.length})`
         });
       })
       .catch(() => setHealth({ ready: false, label: 'APIs: UNREACHABLE' }));
@@ -543,7 +547,17 @@ export default function TradingTerminal() {
                   TIMEFRAME MISMATCH: user selected {timeframe.toUpperCase()} but vision detected {result.visionMetadata.detected_timeframe}.
                 </Banner>
               )}
+              {!result.chiefJudgeVerdict && (
+                <Banner tone="sell">
+                  {result.status === 'DATA_UNAVAILABLE'
+                    ? 'DATA_UNAVAILABLE — '
+                    : 'SESSION FAILED — '}
+                  {result.details || result.error || 'No verdict was produced. The terminal never fabricates an analysis; retry when at least one data source is reachable.'}
+                </Banner>
+              )}
 
+              {result.chiefJudgeVerdict && (
+              <>
               <section className={`relative overflow-hidden border rounded-2xl p-6 ${toneClasses(verdictTone)}`}>
                 <div className="flex justify-between items-start gap-4 flex-wrap">
                   <div>
@@ -666,6 +680,9 @@ export default function TradingTerminal() {
                   })}
                 </div>
               </section>
+
+              </>
+              )}
 
               <section className="grid md:grid-cols-3 gap-4">
                 <FreezeCard

@@ -34,3 +34,10 @@ yarn-error.log*
 # typescript
 next-env.d.ts
 *.tsbuildinfo
+
+# local test fixtures
+/test-charts/
+
+# runtime session store (keep the folder, ignore contents)
+data/*
+!data/.gitkeep

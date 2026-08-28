@@ -26,6 +26,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     screenshotUrl: session.screenshot_url,
     outcome: session.outcome,
     status: session.status,
+    details: session.error,
     createdAt: session.created_at,
     userSymbol: session.user_symbol,
     userTimeframe: session.user_timeframe,

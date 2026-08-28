@@ -36,6 +36,8 @@ export interface AnalyzeInput {
 
 export interface AnalysisApiResult {
   success: boolean;
+  status?: 'COMPLETED' | 'DATA_UNAVAILABLE' | 'FAILED';
+  details?: string;
   sessionId: string;
   reusedFrozenSession?: boolean;
   timeframeMismatchWarning: boolean;
@@ -150,6 +152,47 @@ export async function runAnalysisPipeline(
   };
   await upsertSession(record);
 
+  // HARD GUARD (no-fabrication mandate): if the screenshot yielded nothing
+  // AND every live feed failed, refuse to run the council — asking an LLM to
+  // analyze zero real data is how fabricated analyses are born.
+  const allFeedsDown =
+    marketSnapshot.status !== 'SUCCESS' &&
+    macroSnapshot.status !== 'SUCCESS' &&
+    newsSnapshot.status !== 'SUCCESS';
+  const visionFailed =
+    visionMeta.detected_symbol === 'UNKNOWN' &&
+    visionMeta.detected_current_price === null &&
+    visionMeta.parse_confidence === 0;
+
+  if (allFeedsDown && visionFailed) {
+    const details =
+      'All live data sources (market, macro, news) failed AND the screenshot could not be parsed. ' +
+      'No analysis can be produced without real data — refusing to fabricate one. Retry when at least one source recovers.';
+    record = { ...record, status: 'DATA_UNAVAILABLE', error: details };
+    await upsertSession(record);
+
+    const result: AnalysisApiResult = {
+      success: false,
+      status: 'DATA_UNAVAILABLE',
+      details,
+      sessionId,
+      reusedFrozenSession: false,
+      timeframeMismatchWarning: false,
+      visionMetadata: visionMeta,
+      voteDistribution: { buy: 0, sell: 0, noTrade: 0 },
+      agentOutputs: [],
+      debateResult: null,
+      chiefJudgeVerdict: null,
+      positionSizingResult: null,
+      frozenMarketData: marketSnapshot,
+      frozenMacroData: macroSnapshot,
+      frozenNewsData: newsSnapshot,
+      screenshotUrl
+    };
+    emit?.({ type: 'complete', result });
+    return result;
+  }
+
   const sessionPayload: SnapshotPayload = {
     sessionId,
     imageBufferBase64: imageBase64,
@@ -227,6 +270,7 @@ export async function runAnalysisPipeline(
 
   const result: AnalysisApiResult = {
     success: true,
+    status: 'COMPLETED',
     sessionId,
     reusedFrozenSession: false,
     timeframeMismatchWarning: timeframeMismatch,

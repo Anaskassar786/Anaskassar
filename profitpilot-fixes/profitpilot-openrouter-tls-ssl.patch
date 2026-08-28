@@ -1,0 +1,455 @@
+From b9c6a2bdc4102e716f614f951cb9415f89fa658a Mon Sep 17 00:00:00 2001
+From: Anaskassar786 <Anaskassar786@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 16:39:39 +0000
+Subject: [PATCH] fix(deploy): replace dead OpenRouter models, restore TLS
+ verification, silence SSL warning
+
+Three production issues reported from the deployed environment.
+
+1. Every configured OpenRouter model was unavailable, so all AI features fell
+   back. Verified every candidate live against
+   https://openrouter.ai/api/v1/models/{id}/endpoints on 2026-08-28: the entire
+   2025 :free generation is gone (llama-3.1-8b-instruct, llama-3.3-70b-instruct,
+   qwen3-coder, deepseek-chat-v3-0324, gpt-oss-20b, glm-4.5-air,
+   nemotron-3-nano-30b-a3b all return an empty endpoint list and
+   nemotron-3-nano-omni is a hard 404). Replaced them with slugs that resolve to
+   a live endpoint on four different providers, so one provider outage can no
+   longer silence the whole fallback chain. AI_MODEL_FALLBACK2 and
+   AI_COMMAND_MODEL_FALLBACK both pointed at the dead nemotron-3-nano-30b-a3b.
+
+2. NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate verification for every
+   outbound HTTPS call in the process. No code set it, so the fix is two-sided:
+   delete it from the deployment environment, and add enforceSecureTls() so a
+   leftover value cannot survive a deploy. Node re-reads the variable at connect
+   time, so restoring it at startup is effective (proved against a live
+   self-signed TLS handshake).
+
+3. The pg-connection-string SSL warning is silenced at the source by rewriting
+   sslmode=prefer|require|verify-ca to verify-full in databaseConfigFromEnv.
+   Those modes are aliases today but stop verifying the server certificate in
+   pg v9, so this also removes a silent security downgrade on that upgrade.
+   uselibpqcompat is respected as an explicit opt-out.
+
+Verified: pnpm build, pnpm typecheck and pnpm test (256 files / 3320 tests) all
+pass, plus 16 new tests for normalizePostgresSslMode and enforceSecureTls.
+---
+ .env.example                        | 38 ++++++++++++++++--
+ apps/api/src/main.ts                |  4 ++
+ apps/worker/package.json            |  2 +-
+ apps/worker/src/main.ts             |  4 ++
+ docs/AI_COMMAND.md                  | 11 +++++-
+ packages/db/src/config.test.ts      | 60 +++++++++++++++++++++++++++++
+ packages/db/src/config.ts           | 47 +++++++++++++++++++++-
+ packages/db/src/database.ts         |  6 +++
+ packages/monitoring/src/index.ts    |  1 +
+ packages/monitoring/src/tls.test.ts | 39 +++++++++++++++++++
+ packages/monitoring/src/tls.ts      | 39 +++++++++++++++++++
+ pnpm-lock.yaml                      |  3 ++
+ 12 files changed, 247 insertions(+), 7 deletions(-)
+ create mode 100644 packages/db/src/config.test.ts
+ create mode 100644 packages/monitoring/src/tls.test.ts
+ create mode 100644 packages/monitoring/src/tls.ts
+
+diff --git a/.env.example b/.env.example
+index d131646..498d679 100644
+--- a/.env.example
++++ b/.env.example
+@@ -2,6 +2,19 @@ NODE_ENV=development
+ PORT=3000
+ WORKER_PORT=3100
+ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/profitpilot
++# PRODUCTION (Render/managed Postgres): end the URL with ?sslmode=verify-full.
++# sslmode=prefer | require | verify-ca makes pg-connection-string log
++#   "SECURITY WARNING: The SSL modes 'prefer', 'require', and 'verify-ca' are
++#    treated as aliases for 'verify-full'"
++# and in pg v9 those modes stop verifying the server certificate altogether.
++# ProfitPilot rewrites those three modes to verify-full at startup
++# (packages/db/src/config.ts), but set verify-full in the dashboard too — the
++# rewrite is a safety net, not the source of truth.
++# NEVER set NODE_TLS_REJECT_UNAUTHORIZED. Setting it to '0' disables TLS
++# certificate verification for every outbound HTTPS call in the process.
++# Both apps restore it to '1' at boot and log an error if they find it
++# disabled (packages/monitoring/src/tls.ts), but the variable must be deleted
++# from the deployment environment.
+ REDIS_URL=rediss://default:replace@upstash.example:6379
+ UPSTASH_REDIS_REST_URL=https://upstash.example
+ UPSTASH_REDIS_REST_TOKEN=replace
+@@ -101,10 +114,25 @@ JARVIS_TTS_RESPONSE_FORMAT=mp3
+ # Optional playback speed (0.5-2.0). Left empty = omitted for max compatibility.
+ JARVIS_TTS_SPEED=
+ JARVIS_TTS_TIMEOUT_MS=15000
+-# Verified active free endpoints on 2026-08-22.
++# Verified ACTIVE on 2026-08-28 against https://openrouter.ai/api/v1/models/{id}/endpoints
++# (a model counts as active only when it returns at least one live endpoint).
++# OpenRouter rotates its free tier constantly — the whole 2025 :free generation is
++# now gone: meta-llama/llama-3.1-8b-instruct:free, meta-llama/llama-3.3-70b-instruct:free,
++# qwen/qwen3-coder:free, deepseek/deepseek-chat-v3-0324:free, openai/gpt-oss-20b:free,
++# z-ai/glm-4.5-air:free and nvidia/nemotron-3-nano-30b-a3b:free all return an empty
++# endpoint list today, and nvidia/nemotron-3-nano-omni:free is a hard 404. Do not
++# reintroduce them: every slot below resolves to a live endpoint on a different
++# provider, so one provider going down cannot silence the whole fallback chain.
++#   AI_MODEL_PRIMARY            nvidia/nemotron-3-super-120b-a12b:free  (Nvidia,      262K ctx)
++#   AI_MODEL_FALLBACK1          google/gemma-4-26b-a4b-it:free          (Google,      262K ctx)
++#   AI_MODEL_FALLBACK2          inclusionai/ling-3.0-flash-fin:free     (Novita,      262K ctx)
++#   AI_COMMAND_MODEL_PRIMARY    cohere/north-mini-code:free             (Cohere,      256K ctx)
++#   AI_COMMAND_MODEL_FALLBACK   google/gemma-4-26b-a4b-it:free          (Google,      262K ctx)
++# Spare, also verified active: dots-studio/dots-3-note-preview:free (AtlasCloud, 512K ctx)
++# — usable as a fourth slot, but it is a preview model that expires 2026-09-30.
+ AI_MODEL_PRIMARY=nvidia/nemotron-3-super-120b-a12b:free
+ AI_MODEL_FALLBACK1=google/gemma-4-26b-a4b-it:free
+-AI_MODEL_FALLBACK2=nvidia/nemotron-3-nano-30b-a3b:free
++AI_MODEL_FALLBACK2=inclusionai/ling-3.0-flash-fin:free
+ AI_TIMEOUT_MS=25000
+ AI_MAX_RETRIES=1
+ AI_TEMPERATURE=0.3
+@@ -112,7 +140,11 @@ AI_MAX_TOKENS=2000
+ AI_COMMAND_ENABLED=true
+ AI_COMMAND_API_KEY=
+ AI_COMMAND_MODEL_PRIMARY=cohere/north-mini-code:free
+-AI_COMMAND_MODEL_FALLBACK=nvidia/nemotron-3-nano-30b-a3b:free
++AI_COMMAND_MODEL_FALLBACK=google/gemma-4-26b-a4b-it:free
++# NOTE: the AI Command Center answers from deterministic tool output and only
++# calls the shared AI_MODEL_* provider for prose formatting, so these two
++# variables are reserved — they are not yet read by any code path. They are kept
++# on verified-active slugs so they are correct the day they are wired up.
+ AI_COMMAND_RATE_LIMIT_PER_STORE=30
+ AI_COMMAND_DAILY_BUDGET_USD=0
+ AI_COMMAND_ACTIONS_ENABLED=true
+diff --git a/apps/api/src/main.ts b/apps/api/src/main.ts
+index 9091623..55b9fea 100644
+--- a/apps/api/src/main.ts
++++ b/apps/api/src/main.ts
+@@ -12,9 +12,13 @@ import { createInsightsHubBootstrap, InsightsHubService, PostgresInsightsHubRepo
+ import { buildStoreSnapshot } from './store-snapshot.js'
+ import { shouldRunMigrations } from './ai-keys.js'
+ import { assertProductionAppUrl } from './app-url.js'
++import { enforceSecureTls } from '@profitpilot/monitoring'
+ 
+ const port = Number(process.env.PORT ?? '3000')
+ const logger = loggerFromEnv(process.env)
++// Must run before any outbound HTTPS call so a leftover NODE_TLS_REJECT_UNAUTHORIZED=0
++// in the deployment environment cannot disable certificate verification.
++enforceSecureTls(process.env, (message, context) => logger.error(message, context ?? {}))
+ const startedAt = Date.now()
+ const webDistPath = resolve(process.cwd(), process.env.WEB_DIST_PATH?.trim() || 'apps/web/dist')
+ const webIndexPath = join(webDistPath, 'index.html')
+diff --git a/apps/worker/package.json b/apps/worker/package.json
+index 18fcf26..cd5d7db 100644
+--- a/apps/worker/package.json
++++ b/apps/worker/package.json
+@@ -7,5 +7,5 @@
+   "types": "dist/index.d.ts",
+   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+   "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit", "lint": "tsc -p tsconfig.json --noEmit", "start": "node dist/main.js" },
+-  "dependencies": { "@profitpilot/types": "workspace:*", "@profitpilot/queue": "workspace:*", "@profitpilot/logger": "workspace:*", "@profitpilot/billing": "workspace:*", "@profitpilot/reporting": "workspace:*", "@profitpilot/crypto": "workspace:*", "@profitpilot/db": "workspace:*", "@profitpilot/shopify": "workspace:*" }
++  "dependencies": { "@profitpilot/types": "workspace:*", "@profitpilot/queue": "workspace:*", "@profitpilot/logger": "workspace:*", "@profitpilot/billing": "workspace:*", "@profitpilot/reporting": "workspace:*", "@profitpilot/crypto": "workspace:*", "@profitpilot/db": "workspace:*", "@profitpilot/shopify": "workspace:*", "@profitpilot/monitoring": "workspace:*" }
+ }
+diff --git a/apps/worker/src/main.ts b/apps/worker/src/main.ts
+index 08591f0..e178fbc 100644
+--- a/apps/worker/src/main.ts
++++ b/apps/worker/src/main.ts
+@@ -4,8 +4,12 @@ import { WorkerRuntime } from './worker.js'
+ import { createWorkerHealthServer } from './health.js'
+ import { createInsightsDiscoveryRunner } from './insights-discovery-job.js'
+ import { createBillingJobs } from './billing-job.js'
++import { enforceSecureTls } from '@profitpilot/monitoring'
+ 
+ const logger = loggerFromEnv(process.env)
++// Must run before any outbound HTTPS call so a leftover NODE_TLS_REJECT_UNAUTHORIZED=0
++// in the deployment environment cannot disable certificate verification.
++enforceSecureTls(process.env, (message, context) => logger.error(message, context ?? {}))
+ 
+ process.on('unhandledRejection', (reason) => {
+   logger.error('Unhandled rejection in worker', {
+diff --git a/docs/AI_COMMAND.md b/docs/AI_COMMAND.md
+index 95b2dcc..6185f4b 100644
+--- a/docs/AI_COMMAND.md
++++ b/docs/AI_COMMAND.md
+@@ -75,11 +75,18 @@ Email send requires a verified merchant sender and a live SMTP (Brevo) response.
+ ```
+ AI_COMMAND_ENABLED=true
+ AI_COMMAND_API_KEY=
+-AI_COMMAND_MODEL_PRIMARY=meta-llama/llama-3.3-70b-instruct:free
+-AI_COMMAND_MODEL_FALLBACK=google/gemma-2-9b-it:free
++AI_COMMAND_MODEL_PRIMARY=cohere/north-mini-code:free
++AI_COMMAND_MODEL_FALLBACK=google/gemma-4-26b-a4b-it:free
+ AI_COMMAND_ACTIONS_ENABLED=true
+ ```
+ 
++The two `AI_COMMAND_MODEL_*` slugs above were verified active on 2026-08-28
++against `https://openrouter.ai/api/v1/models/{id}/endpoints`. The values
++previously documented here (`meta-llama/llama-3.3-70b-instruct:free` and
++`google/gemma-2-9b-it:free`) are both dead — they return an empty endpoint list,
++which is the same failure that produced "every configured OpenRouter model is
++unavailable" in production. Keep them in sync with `AI_MODEL_*` in `.env.example`.
++
+ The production command path is deterministic and answers directly from tool results. Provider configuration is reserved for a future metered narration layer; AI Command does not make a discarded/unmetered model call before answering. It never fills gaps with invented numbers.
+ 
+ ## Campaigns
+diff --git a/packages/db/src/config.test.ts b/packages/db/src/config.test.ts
+new file mode 100644
+index 0000000..b7bfbaf
+--- /dev/null
++++ b/packages/db/src/config.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, it } from 'vitest'
++import { databaseConfigFromEnv, normalizePostgresSslMode } from './config.js'
++
++describe('normalizePostgresSslMode', () => {
++  it('rewrites sslmode=require to verify-full', () => {
++    expect(normalizePostgresSslMode('postgresql://u:p@host:5432/db?sslmode=require')).toEqual({
++      connectionString: 'postgresql://u:p@host:5432/db?sslmode=verify-full',
++      rewrittenFrom: 'require',
++    })
++  })
++  it('rewrites sslmode=prefer and sslmode=verify-ca, whatever the case', () => {
++    expect(normalizePostgresSslMode('postgresql://host/db?sslmode=prefer').rewrittenFrom).toBe('prefer')
++    expect(normalizePostgresSslMode('postgresql://host/db?sslmode=VERIFY-CA').rewrittenFrom).toBe('verify-ca')
++    expect(normalizePostgresSslMode('postgresql://host/db?sslmode=VERIFY-CA').connectionString).toBe('postgresql://host/db?sslmode=verify-full')
++  })
++  it('leaves verify-full, disable and no-verify untouched', () => {
++    for (const mode of ['verify-full', 'disable', 'no-verify']) {
++      const url = `postgresql://host/db?sslmode=${mode}`
++      expect(normalizePostgresSslMode(url)).toEqual({ connectionString: url, rewrittenFrom: null })
++    }
++  })
++  it('respects an explicit uselibpqcompat opt-in', () => {
++    const url = 'postgresql://host/db?sslmode=require&uselibpqcompat=true'
++    expect(normalizePostgresSslMode(url)).toEqual({ connectionString: url, rewrittenFrom: null })
++  })
++  it('preserves every other query parameter and rewrites only sslmode', () => {
++    const normalized = normalizePostgresSslMode('postgresql://u:p@host:5432/db?sslmode=require&application_name=profitpilot&connect_timeout=10')
++    expect(normalized.rewrittenFrom).toBe('require')
++    const params = new URLSearchParams(normalized.connectionString.split('?')[1])
++    expect(params.get('sslmode')).toBe('verify-full')
++    expect(params.get('application_name')).toBe('profitpilot')
++    expect(params.get('connect_timeout')).toBe('10')
++  })
++  it('leaves connection strings without a query string untouched', () => {
++    const url = 'postgresql://u:p@host:5432/db'
++    expect(normalizePostgresSslMode(url)).toEqual({ connectionString: url, rewrittenFrom: null })
++  })
++  it('never touches credentials in the base URL', () => {
++    const url = 'postgresql://user:p%40ss%3Aword@host:5432/db?sslmode=require'
++    expect(normalizePostgresSslMode(url).connectionString).toBe('postgresql://user:p%40ss%3Aword@host:5432/db?sslmode=verify-full')
++  })
++})
++
++describe('databaseConfigFromEnv', () => {
++  it('normalizes a production-style DATABASE_URL and reports the original mode', () => {
++    const config = databaseConfigFromEnv({ DATABASE_URL: 'postgresql://u:p@host:5432/db?sslmode=require', NODE_ENV: 'production' })
++    expect(config.connectionString).toBe('postgresql://u:p@host:5432/db?sslmode=verify-full')
++    expect(config.sslModeRewrittenFrom).toBe('require')
++    expect(config.ssl).toBe(true)
++  })
++  it('reports null when the URL already used verify-full', () => {
++    const config = databaseConfigFromEnv({ DATABASE_URL: 'postgresql://u:p@host:5432/db?sslmode=verify-full' })
++    expect(config.sslModeRewrittenFrom).toBeNull()
++    expect(config.connectionString).toBe('postgresql://u:p@host:5432/db?sslmode=verify-full')
++  })
++  it('reports null when the URL carries no sslmode at all', () => {
++    const config = databaseConfigFromEnv({ DATABASE_URL: 'postgres://localhost/db' })
++    expect(config.sslModeRewrittenFrom).toBeNull()
++  })
++})
+diff --git a/packages/db/src/config.ts b/packages/db/src/config.ts
+index 4792418..8494178 100644
+--- a/packages/db/src/config.ts
++++ b/packages/db/src/config.ts
+@@ -4,8 +4,45 @@ export type DatabaseConfig = Readonly<{
+   idleTimeoutMs: number
+   statementTimeoutMs: number
+   ssl: boolean
++  /** Set when `DATABASE_URL` arrived with a deprecated `sslmode` (see below). */
++  sslModeRewrittenFrom: string | null
+ }>
+ 
++/**
++ * `pg-connection-string` v2.x (shipped with `pg` v8.23) treats the SSL modes
++ * `prefer`, `require` and `verify-ca` as aliases of `verify-full`, and prints
++ * this startup warning the first time it parses one of them:
++ *
++ *   SECURITY WARNING: The SSL modes 'prefer', 'require', and 'verify-ca' are
++ *   treated as aliases for 'verify-full'. In the next major version
++ *   (pg-connection-string v3.0.0 and pg v9.0.0), these modes will adopt
++ *   standard libpq semantics, which have weaker security guarantees.
++ *
++ * In pg v9 those modes stop verifying the server certificate, so a connection
++ * string left on `sslmode=require` silently downgrades from "verified TLS" to
++ * "encrypted but unauthenticated TLS" on the next major upgrade. Rewriting the
++ * mode to `verify-full` today removes the warning, keeps the strict behaviour
++ * the alias already provided, and pins that behaviour across the pg 9 upgrade.
++ *
++ * `uselibpqcompat=true` is an explicit opt-in to the weaker libpq semantics, so
++ * those connection strings are left untouched.
++ */
++const DEPRECATED_SSL_MODES = new Set(['prefer', 'require', 'verify-ca'])
++
++export function normalizePostgresSslMode(connectionString: string): Readonly<{ connectionString: string; rewrittenFrom: string | null }> {
++  const queryIndex = connectionString.indexOf('?')
++  if (queryIndex === -1) return { connectionString, rewrittenFrom: null }
++  const base = connectionString.slice(0, queryIndex)
++  const query = connectionString.slice(queryIndex + 1)
++  if (query.length === 0) return { connectionString, rewrittenFrom: null }
++  const params = new URLSearchParams(query)
++  const mode = params.get('sslmode')?.trim().toLowerCase() ?? null
++  if (!mode || !DEPRECATED_SSL_MODES.has(mode)) return { connectionString, rewrittenFrom: null }
++  if (params.get('uselibpqcompat')?.trim().toLowerCase() === 'true') return { connectionString, rewrittenFrom: null }
++  params.set('sslmode', 'verify-full')
++  return { connectionString: `${base}?${params.toString()}`, rewrittenFrom: mode }
++}
++
+ export function databaseConfigFromEnv(env: Readonly<Record<string, string | undefined>>): DatabaseConfig {
+   const connectionString = env.DATABASE_URL?.trim() ?? ''
+   if (!connectionString.startsWith('postgres://') && !connectionString.startsWith('postgresql://')) {
+@@ -14,7 +51,15 @@ export function databaseConfigFromEnv(env: Readonly<Record<string, string | unde
+   const maxConnections = parsePositiveInteger(env.DB_POOL_MAX ?? '10', 'DB_POOL_MAX')
+   const idleTimeoutMs = parsePositiveInteger(env.DB_IDLE_TIMEOUT_MS ?? '10000', 'DB_IDLE_TIMEOUT_MS')
+   const statementTimeoutMs = parsePositiveInteger(env.DB_STATEMENT_TIMEOUT_MS ?? '5000', 'DB_STATEMENT_TIMEOUT_MS')
+-  return { connectionString, maxConnections, idleTimeoutMs, statementTimeoutMs, ssl: env.NODE_ENV === 'production' }
++  const normalized = normalizePostgresSslMode(connectionString)
++  return {
++    connectionString: normalized.connectionString,
++    maxConnections,
++    idleTimeoutMs,
++    statementTimeoutMs,
++    ssl: env.NODE_ENV === 'production',
++    sslModeRewrittenFrom: normalized.rewrittenFrom,
++  }
+ }
+ 
+ function parsePositiveInteger(value: string, name: string): number {
+diff --git a/packages/db/src/database.ts b/packages/db/src/database.ts
+index b1de11e..ca572a1 100644
+--- a/packages/db/src/database.ts
++++ b/packages/db/src/database.ts
+@@ -16,6 +16,12 @@ export interface SqlExecutor {
+ export class PostgresDatabase implements SqlExecutor {  private readonly pool: Pool
+ 
+   public constructor(config: DatabaseConfig) {
++    if (config.sslModeRewrittenFrom) {
++      poolLogger.warn('DATABASE_URL sslmode normalized to verify-full', {
++        requested: config.sslModeRewrittenFrom,
++        reason: 'prefer/require/verify-ca are aliases of verify-full in pg 8 and downgrade to unverified TLS in pg 9',
++      })
++    }
+     this.pool = new Pool({
+       connectionString: config.connectionString,
+       max: config.maxConnections,
+diff --git a/packages/monitoring/src/index.ts b/packages/monitoring/src/index.ts
+index 1306198..808e2b7 100644
+--- a/packages/monitoring/src/index.ts
++++ b/packages/monitoring/src/index.ts
+@@ -1,4 +1,5 @@
+ export * from './monitor.js'
++export * from './tls.js'
+ export * from './access-review.js'
+ export * from './load.js'
+ export * from './f9-controls.js'
+diff --git a/packages/monitoring/src/tls.test.ts b/packages/monitoring/src/tls.test.ts
+new file mode 100644
+index 0000000..f7eb67e
+--- /dev/null
++++ b/packages/monitoring/src/tls.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from 'vitest'
++import { enforceSecureTls } from './index.js'
++
++describe('enforceSecureTls', () => {
++  it('restores certificate verification when the deployment disables it', () => {
++    const env: Record<string, string | undefined> = { NODE_TLS_REJECT_UNAUTHORIZED: '0' }
++    const logs: string[] = []
++    expect(enforceSecureTls(env, (message) => logs.push(message))).toEqual({ enforced: true, previous: '0' })
++    expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('1')
++    expect(logs[0]).toContain('NODE_TLS_REJECT_UNAUTHORIZED')
++  })
++  it('leaves a secure value alone', () => {
++    const env: Record<string, string | undefined> = { NODE_TLS_REJECT_UNAUTHORIZED: '1' }
++    expect(enforceSecureTls(env).enforced).toBe(false)
++    expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('1')
++  })
++  it('does nothing when the variable is absent', () => {
++    const env: Record<string, string | undefined> = {}
++    expect(enforceSecureTls(env)).toEqual({ enforced: false, previous: null })
++    expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined()
++  })
++  it('does not invent the variable when it was never set', () => {
++    const env: Record<string, string | undefined> = { PORT: '3000' }
++    enforceSecureTls(env)
++    expect('NODE_TLS_REJECT_UNAUTHORIZED' in env).toBe(false)
++  })
++  it('treats only the exact insecure value 0 as disabled', () => {
++    for (const value of ['false', '00', 'no']) {
++      const env: Record<string, string | undefined> = { NODE_TLS_REJECT_UNAUTHORIZED: value }
++      expect(enforceSecureTls(env).enforced).toBe(false)
++      expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBe(value)
++    }
++  })
++  it('mutates a live process.env-like object in place', () => {
++    const env: Record<string, string | undefined> = { NODE_TLS_REJECT_UNAUTHORIZED: ' 0 ' }
++    expect(enforceSecureTls(env).enforced).toBe(true)
++    expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('1')
++  })
++})
+diff --git a/packages/monitoring/src/tls.ts b/packages/monitoring/src/tls.ts
+new file mode 100644
+index 0000000..cc12d9d
+--- /dev/null
++++ b/packages/monitoring/src/tls.ts
+@@ -0,0 +1,39 @@
++import type { JsonObject } from '@profitpilot/logger'
++
++export type TlsGuardResult = Readonly<{
++  /** True when the process was found insecure and certificate verification was restored. */
++  enforced: boolean
++  previous: string | null
++}>
++
++/**
++ * Deployment hardening: `NODE_TLS_REJECT_UNAUTHORIZED=0` is a Node switch that
++ * disables TLS certificate verification process-wide — every outbound HTTPS
++ * call (OpenRouter, Shopify Admin API, Upstash, Sentry, Postgres over TLS)
++ * silently accepts a forged certificate, and Node prints a warning on the
++ * first use of the weakened setting.
++ *
++ * It is easy for that variable to survive in a Render/Railway environment
++ * group long after whatever proxy problem motivated it, so the process refuses
++ * to inherit it: the value is restored before any socket is opened. Node reads
++ * `process.env.NODE_TLS_REJECT_UNAUTHORIZED` lazily at connect time (any value
++ * other than the exact string `'0'` means "verify"), so restoring it at startup
++ * is enough to make every later connection verifying again.
++ *
++ * The correct fix is still to delete the variable from the deployment
++ * dashboard — this guard is the safety net for the window before that happens.
++ */
++export function enforceSecureTls(
++  env: Record<string, string | undefined>,
++  log?: (message: string, context?: JsonObject) => void,
++): TlsGuardResult {
++  const current = env.NODE_TLS_REJECT_UNAUTHORIZED
++  if (current === undefined || current.trim() !== '0') return { enforced: false, previous: current ?? null }
++  env.NODE_TLS_REJECT_UNAUTHORIZED = '1'
++  log?.('SECURITY: NODE_TLS_REJECT_UNAUTHORIZED=0 disables TLS certificate verification — re-enabled at startup', {
++    variable: 'NODE_TLS_REJECT_UNAUTHORIZED',
++    action: 'restored_to_1',
++    remediation: 'Remove NODE_TLS_REJECT_UNAUTHORIZED from the Render environment group; this guard should never fire.',
++  })
++  return { enforced: true, previous: current }
++}
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 6842be8..7b6b480 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -150,6 +150,9 @@ importers:
+       '@profitpilot/logger':
+         specifier: workspace:*
+         version: link:../../packages/logger
++      '@profitpilot/monitoring':
++        specifier: workspace:*
++        version: link:../../packages/monitoring
+       '@profitpilot/queue':
+         specifier: workspace:*
+         version: link:../../packages/queue
+-- 
+2.39.5
+

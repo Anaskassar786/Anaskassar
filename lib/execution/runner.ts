@@ -1,6 +1,6 @@
 import { AGENT_DEFINITIONS } from '@/lib/agents/definitions';
 import { AgentOutputSchema, AgentOutput, VisionParserOutput } from '@/types/analysis';
-import { chatJson } from '@/lib/llm/client';
+import { chatJson, isCreditError, isPermanentLlmError, isRateLimitError } from '@/lib/llm/client';
 import {
   asStringArray,
   clamp,
@@ -82,8 +82,9 @@ export async function executeAgentBatch(
   onProgress?: (agentNumber: number, status: string, output?: AgentOutput, meta?: AgentRunMeta) => void
 ): Promise<Array<AgentOutput & AgentRunMeta>> {
   const results: Array<AgentOutput & AgentRunMeta> = [];
-  const BATCH_SIZE = 2;
-  const DELAY_BETWEEN_BATCHES_MS = 3000;
+  // NVIDIA free NIM rate-limits parallel bursts. One agent at a time.
+  const BATCH_SIZE = 1;
+  const DELAY_BETWEEN_BATCHES_MS = 4000;
 
   for (let i = 0; i < AGENT_DEFINITIONS.length; i += BATCH_SIZE) {
     const batch = AGENT_DEFINITIONS.slice(i, i + BATCH_SIZE);
@@ -107,30 +108,30 @@ export async function executeAgentBatch(
   return results;
 }
 
+function compactMarket(market: MarketDataSnapshot): MarketDataSnapshot {
+  if (!market.candles || market.candles.length <= 12) return market;
+  return { ...market, candles: market.candles.slice(0, 12) };
+}
+
+function compactNews(news: NewsDataSnapshot): NewsDataSnapshot {
+  if (!news.articles || news.articles.length <= 5) return news;
+  return { ...news, articles: news.articles.slice(0, 5) };
+}
+
 async function callSingleAgentWithRetry(
   agentDef: (typeof AGENT_DEFINITIONS)[0],
   payload: SnapshotPayload,
-  retries = 3
+  retries = 2
 ): Promise<{ output: AgentOutput; meta: AgentRunMeta }> {
   let attempt = 0;
   let lastError = 'Unknown error';
+  // Macro + news specialists work from frozen feeds; skip the screenshot to cut image-token spend.
+  const attachChart = agentDef.number !== 8 && agentDef.number !== 9;
 
   while (attempt < retries) {
     try {
       const mime = payload.imageMimeType || 'image/png';
-      const { data, provider, model } = await chatJson<Record<string, unknown>>({
-        prefer: ['openrouter', 'gemini', 'nvidia'],
-        json: true,
-        temperature: 0.15,
-        timeoutMs: 55000,
-        messages: [
-          { role: 'system', content: agentDef.systemPrompt },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `ANALYSIS SNAPSHOT (IMMUTABLE):
+      const text = `ANALYSIS SNAPSHOT (IMMUTABLE):
 Session: ${payload.sessionId}
 User Symbol: ${payload.userSymbol}
 User Timeframe: ${payload.userTimeframe}
@@ -139,18 +140,31 @@ Detected Timeframe: ${payload.visionMetadata.detected_timeframe}
 Detected Price: ${payload.visionMetadata.detected_current_price}
 Visible Indicators: ${JSON.stringify(payload.visionMetadata.visible_indicators)}
 Vision Notes: ${payload.visionMetadata.raw_ocr_notes}
-Market Data: ${JSON.stringify(payload.marketData)}
+Market Data: ${JSON.stringify(compactMarket(payload.marketData))}
 Macro Data: ${JSON.stringify(payload.macroData)}
-News Data: ${JSON.stringify(payload.newsData)}
+News Data: ${JSON.stringify(compactNews(payload.newsData))}
 User Risk Amount: $${payload.riskAmount}
 Account Balance: ${payload.accountBalance ?? 'NOT_PROVIDED'}
 Desired Profit: ${payload.desiredProfit ?? 'NOT_PROVIDED'}
 
-Perform your specialist Round 1 analysis independently. You cannot see other agents. Output pure JSON matching schema.`
-              },
-              { type: 'image_url', image_url: { url: `data:${mime};base64,${payload.imageBufferBase64}` } }
-            ]
-          }
+Perform your specialist Round 1 analysis independently. You cannot see other agents. Output pure JSON matching schema.`;
+
+      const userContent: Array<
+        | { type: 'text'; text: string }
+        | { type: 'image_url'; image_url: { url: string } }
+      > = [{ type: 'text', text }];
+      if (attachChart) {
+        userContent.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${payload.imageBufferBase64}` } });
+      }
+
+      const { data, provider, model } = await chatJson<Record<string, unknown>>({
+        json: true,
+        temperature: 0.15,
+        timeoutMs: 55000,
+        maxTokens: 4096,
+        messages: [
+          { role: 'system', content: agentDef.systemPrompt },
+          { role: 'user', content: userContent }
         ]
       });
 
@@ -161,7 +175,10 @@ Perform your specialist Round 1 analysis independently. You cannot see other age
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       attempt++;
-      const backoffMs = lastError.includes('RATE_LIMIT') ? Math.pow(2, attempt) * 2000 : 2000;
+      if (isCreditError(lastError) || (isPermanentLlmError(lastError) && !isRateLimitError(lastError))) {
+        break;
+      }
+      const backoffMs = isRateLimitError(lastError) ? Math.pow(2, attempt) * 3000 : 2000;
       if (attempt < retries) {
         await new Promise((r) => setTimeout(r, backoffMs));
       }

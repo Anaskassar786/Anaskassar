@@ -68,7 +68,7 @@ interface AnalysisResult {
     bullCounterargument: string;
     bearCounterargument: string;
     synthesisConclusion: string;
-  };
+  } | null;
   chiefJudgeVerdict: {
     final_decision: Decision;
     vote_distribution: { buy: number; sell: number; no_trade: number };
@@ -87,7 +87,8 @@ interface AnalysisResult {
     warnings: string[];
     data_quality: string;
     chief_judge_model?: string;
-  };
+    provider_used?: string;
+  } | null;
   positionSizingResult: { positionSizeLots: number | null; slDistancePips: number; warning?: string } | null;
   frozenMarketData: { status: string; provider: string; price?: number; error?: string; symbol?: string; timeframe?: string };
   frozenMacroData: { status: string; provider: string; latestValue?: string; latestDate?: string; error?: string; seriesId?: string };
@@ -451,7 +452,7 @@ export default function TradingTerminal() {
                   onChange={(e) => setReuseFrozen(e.target.checked)}
                   className="mt-0.5 accent-emerald-500"
                 />
-                Replay frozen session if this screenshot hash already exists (no live API recall).
+                Replay frozen session if this screenshot hash already exists (no live API recall). Failed / INSUFFICIENT council runs are never reused.
               </label>
 
               <button
@@ -572,6 +573,11 @@ export default function TradingTerminal() {
                     <div className="text-3xl font-bold">{result.chiefJudgeVerdict.final_confidence}/100</div>
                     <div className="text-[10px] text-slate-500 mt-1">Not a win-rate · not a probability of profit</div>
                     <div className="text-[10px] text-slate-500 mt-1">DQ: {result.chiefJudgeVerdict.data_quality}</div>
+                    {(result.chiefJudgeVerdict.chief_judge_model || result.chiefJudgeVerdict.provider_used) && (
+                      <div className="text-[10px] text-slate-500 mt-1">
+                        {result.chiefJudgeVerdict.provider_used}/{result.chiefJudgeVerdict.chief_judge_model}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -607,6 +613,7 @@ export default function TradingTerminal() {
                 </div>
               </section>
 
+              {result.debateResult && (
               <section className="bg-slate-950/80 border border-slate-800 rounded-2xl p-5 space-y-3">
                 <h3 className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest border-b border-slate-800 pb-2 flex items-center gap-2">
                   <Scale size={14} /> Adversarial Debate Synthesis
@@ -632,6 +639,7 @@ export default function TradingTerminal() {
                   {result.debateResult.synthesisConclusion}
                 </p>
               </section>
+              )}
 
               <section className="bg-slate-950/80 border border-slate-800 rounded-2xl p-5">
                 <h3 className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2">
@@ -726,17 +734,21 @@ export default function TradingTerminal() {
                 {result.visionMetadata.visible_indicators?.length > 0 && (
                   <p>Indicators: {result.visionMetadata.visible_indicators.join(', ')}</p>
                 )}
-                {(result.chiefJudgeVerdict.warnings || []).map((w) => (
-                  <p key={w} className="text-amber-300 flex gap-2">
+                {result.screenshotUrl && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={result.screenshotUrl} alt="Stored chart" className="mt-2 max-h-40 rounded-lg border border-slate-800 object-contain" />
+                )}
+                {(result.chiefJudgeVerdict?.warnings || []).map((w, i) => (
+                  <p key={`${i}-${w}`} className="text-amber-300 flex gap-2">
                     <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}
                   </p>
                 ))}
                 <div className="grid md:grid-cols-2 gap-3 pt-2">
-                  <List label="Strongest bullish" items={result.chiefJudgeVerdict.strongest_bullish_arguments} />
-                  <List label="Strongest bearish" items={result.chiefJudgeVerdict.strongest_bearish_arguments} />
+                  <List label="Strongest bullish" items={result.chiefJudgeVerdict?.strongest_bullish_arguments} />
+                  <List label="Strongest bearish" items={result.chiefJudgeVerdict?.strongest_bearish_arguments} />
                 </div>
-                <List label="Rejected arguments" items={result.chiefJudgeVerdict.rejected_arguments} />
-                <List label="Invalidation" items={result.chiefJudgeVerdict.invalidation_conditions} />
+                <List label="Rejected arguments" items={result.chiefJudgeVerdict?.rejected_arguments} />
+                <List label="Invalidation" items={result.chiefJudgeVerdict?.invalidation_conditions} />
               </section>
 
               <section className="bg-slate-950/80 border border-slate-800 rounded-2xl p-5">
@@ -791,22 +803,6 @@ export default function TradingTerminal() {
       <footer className="mt-6 text-[10px] text-slate-600 text-center tracking-wide">
         TRADING AI AK is a private decision-support terminal. Not a broker. No order routing. Never fabricates prices, candles, indicators, API responses, backtests, win rates, confidence-as-probability, or news.
       </footer>
-
-      <style jsx global>{`
-        .field {
-          width: 100%;
-          font-size: 12px;
-          background: #020617;
-          border: 1px solid #1e293b;
-          border-radius: 0.5rem;
-          padding: 0.5rem 0.6rem;
-          color: #e2e8f0;
-          outline: none;
-        }
-        .field:focus {
-          border-color: #10b981;
-        }
-      `}</style>
     </div>
   );
 }
@@ -862,8 +858,8 @@ function List({ label, items }: { label: string; items?: string[] }) {
     <div>
       <div className="text-slate-500 uppercase tracking-wider text-[10px] mb-1">{label}</div>
       <ul className="list-disc pl-4 space-y-0.5 text-slate-300">
-        {items.map((item) => (
-          <li key={item}>{item}</li>
+        {items.map((item, i) => (
+          <li key={`${i}-${item.slice(0, 48)}`}>{item}</li>
         ))}
       </ul>
     </div>

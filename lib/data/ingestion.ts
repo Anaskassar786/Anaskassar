@@ -136,7 +136,10 @@ export async function fetchMarketNews(query = 'gold price inflation Fed'): Promi
 
   try {
     const url = `${env('NEWS_API_BASE_URL', 'https://newsapi.org')}/v2/everything?q=${encodeURIComponent(query)}&sortBy=publishedAt&pageSize=5&language=en&apiKey=${apiKey}`;
-    const res = await fetch(url, { cache: 'no-store' });
+    const res = await fetch(url, {
+      cache: 'no-store',
+      headers: { 'User-Agent': 'TradingAI-AK/1.0 (decision-support; no-execution)' }
+    });
     const data = (await res.json()) as {
       status?: string;
       message?: string;

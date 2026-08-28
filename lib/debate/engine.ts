@@ -28,6 +28,20 @@ export async function runAdversarialDebate(agentOutputs: AgentOutput[], symbol: 
   const topBull = strongest(buyVotes) || { agent_name: 'None', evidence: ['No bullish agent'] };
   const topBear = strongest(sellVotes) || { agent_name: 'None', evidence: ['No bearish agent'] };
 
+  const allInsufficient = agentOutputs.every((a) => a.data_quality === 'INSUFFICIENT');
+  if (voteSummary.buy === 0 && voteSummary.sell === 0) {
+    return {
+      voteSummary,
+      topBullishClaim: { agent: topBull.agent_name, claim: topBull.evidence?.[0] || 'No bullish agent' },
+      topBearishClaim: { agent: topBear.agent_name, claim: topBear.evidence?.[0] || 'No bearish agent' },
+      bullCounterargument: 'Debate skipped — no bullish specialist produced a BUY case.',
+      bearCounterargument: 'Debate skipped — no bearish specialist produced a SELL case.',
+      synthesisConclusion: allInsufficient
+        ? 'All Round 1 specialists returned INSUFFICIENT DATA. Chief Judge must evaluate Round 1 directly. No fabricated debate arguments.'
+        : 'Round 1 has no directional votes. Chief Judge must evaluate NO_TRADE evidence directly. Debate skipped to avoid fabricating arguments.'
+    };
+  }
+
   const prompt = `
 You are the Debate Controller for Trading AI AK.
 Symbol: ${symbol}
@@ -65,10 +79,10 @@ Return JSON strictly:
       bearCounterargument?: string;
       synthesisConclusion?: string;
     }>({
-      prefer: ['openrouter', 'nvidia', 'gemini'],
       json: true,
       temperature: 0.3,
       timeoutMs: 45000,
+      maxTokens: 2048,
       messages: [{ role: 'user', content: prompt }]
     });
 

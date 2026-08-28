@@ -90,6 +90,39 @@ Return ONLY valid JSON:
   "data_quality": "HIGH" | "MEDIUM" | "LOW" | "INSUFFICIENT"
 }`;
 
+  const directional = agentOutputs.filter((a) => a.decision === 'BUY' || a.decision === 'SELL');
+  const allInsufficient = agentOutputs.length > 0 && agentOutputs.every((a) => a.data_quality === 'INSUFFICIENT');
+  if (allInsufficient && directional.length === 0) {
+    const fallback = coerceJudge(
+      {
+        final_decision: 'NO_TRADE',
+        vote_distribution: {
+          buy: debateResult.voteSummary.buy,
+          sell: debateResult.voteSummary.sell,
+          no_trade: debateResult.voteSummary.noTrade
+        },
+        final_confidence: 0,
+        entry: { low: null, high: null },
+        stop_loss: null,
+        targets: { tp1: null, tp2: null, tp3: null },
+        risk_amount: sessionPayload.riskAmount,
+        position_size: null,
+        risk_reward: null,
+        decision_summary:
+          'NO_TRADE — every specialist returned INSUFFICIENT DATA and there is no directional case to judge. The terminal will not fabricate levels, conviction, or a trade.',
+        strongest_bullish_arguments: [],
+        strongest_bearish_arguments: [],
+        rejected_arguments: ['No Round 1 evidence quality sufficient to support BUY or SELL'],
+        invalidation_conditions: ['Restore at least one live LLM provider and re-run (uncheck frozen replay if a prior failed session was stored)'],
+        warnings: ['INSUFFICIENT DATA: council offline or feeds empty — judge did not invent a setup'],
+        data_quality: 'INSUFFICIENT'
+      },
+      debateResult.voteSummary,
+      sessionPayload.riskAmount
+    );
+    return { ...fallback, chief_judge_model: 'local-guard', provider_used: 'none' };
+  }
+
   const userPayload = {
     vision_metadata: sessionPayload.visionMetadata,
     frozen_market_data: sessionPayload.marketData,
@@ -103,10 +136,10 @@ Return ONLY valid JSON:
 
   try {
     const { data, provider, model } = await chatJson<Record<string, unknown>>({
-      prefer: ['nvidia', 'openrouter', 'gemini'],
       json: true,
       temperature: 0.2,
       timeoutMs: 70000,
+      maxTokens: 4096,
       messages: [
         { role: 'system', content: judgeSystemPrompt },
         { role: 'user', content: JSON.stringify(userPayload) }

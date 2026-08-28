@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS analysis_sessions (
     frozen_market_data JSONB,
     frozen_news_data JSONB,
     frozen_macro_data JSONB,
+    vision_metadata JSONB,
     status VARCHAR(20) DEFAULT 'RUNNING' CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'DATA_UNAVAILABLE'))
 );
 

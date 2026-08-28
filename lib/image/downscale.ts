@@ -10,7 +10,7 @@
  */
 
 export interface DownscaleOptions {
-  /** Longest edge kept, in CSS pixels. Default 1600. */
+  /** Longest edge kept, in CSS pixels. Default 1400 (safe for free-tier vision quotas). */
   maxEdge?: number;
   /** JPEG quality for the resized copy. Default 0.85. */
   quality?: number;

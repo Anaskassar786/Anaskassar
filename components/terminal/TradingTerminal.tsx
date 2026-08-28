@@ -322,7 +322,9 @@ export default function TradingTerminal() {
     let payloadName = file.name || 'chart.png';
     try {
       setPhaseLabel('PHASE 0: Preparing screenshot');
-      const prepared = await downscaleImage(file, file.name || 'chart.png');
+      const configuredMaxEdge = Number(process.env.NEXT_PUBLIC_LLM_IMAGE_MAX_EDGE || 1400);
+      const maxEdge = Number.isFinite(configuredMaxEdge) && configuredMaxEdge >= 640 ? Math.floor(configuredMaxEdge) : 1400;
+      const prepared = await downscaleImage(file, file.name || 'chart.png', { maxEdge });
       payload = prepared.blob;
       payloadName = prepared.name;
       setUploadNote(prepared.note);

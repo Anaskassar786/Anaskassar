@@ -83,6 +83,7 @@ Return JSON strictly:
       json: true,
       temperature: 0.3,
       timeoutMs: 45000,
+      maxTokens: 2048,
       messages: [{ role: 'user', content: prompt }]
     });
 

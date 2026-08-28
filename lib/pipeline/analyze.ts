@@ -4,6 +4,7 @@ import { fetchFredMacroData, fetchMarketNews, fetchTwelveData } from '@/lib/data
 import { executeAgentBatch, SnapshotPayload } from '@/lib/execution/runner';
 import { runAdversarialDebate } from '@/lib/debate/engine';
 import { runChiefJudge } from '@/lib/judge/chief_judge';
+import { resetLlmCooldowns } from '@/lib/llm/client';
 import { calculatePositionSize, calculateRiskReward } from '@/lib/quant/sizing';
 import {
   AnalysisSessionRecord,
@@ -81,6 +82,7 @@ export async function runAnalysisPipeline(
   input: AnalyzeInput,
   emit?: (event: PipelineEvent) => void
 ): Promise<AnalysisApiResult> {
+  resetLlmCooldowns();
   const screenshotHash = crypto.createHash('sha256').update(input.imageBuffer).digest('hex');
 
   if (input.reuseFrozen !== false) {

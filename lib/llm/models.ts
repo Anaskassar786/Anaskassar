@@ -129,8 +129,32 @@ export function isPermanentLlmError(message: string): boolean {
 
 export function isRateLimitError(message: string): boolean {
   const m = message.toLowerCase();
-  return m.includes('rate_limit') || m.includes('429') || m.includes('too many requests');
+  return m.includes('rate_limit') || m.includes('429') || m.includes('too many requests') || m.includes('quota exceeded');
 }
+
+export function isCreditError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes('credits:') ||
+    m.includes(' 402') ||
+    m.includes('402:') ||
+    m.includes('"code":402') ||
+    m.includes('requires more credits') ||
+    m.includes('can only afford') ||
+    m.includes('insufficient credits') ||
+    m.includes('upgrade to a paid account')
+  );
+}
+
+/** OpenRouter 402 often says: "can only afford 8819". */
+export function parseAffordableMaxTokens(message: string): number | null {
+  const match = message.match(/can only afford\s+(\d+)/i);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export const DEFAULT_MAX_TOKENS = 4096;
 
 export function isJsonModeError(message: string): boolean {
   const m = message.toLowerCase();

@@ -1,10 +1,13 @@
 import { extractJsonObject } from '@/lib/llm/json';
 import {
+  DEFAULT_MAX_TOKENS,
+  isCreditError,
   isJsonModeError,
   isPermanentLlmError,
   isRateLimitError,
   isRetiredModel,
   modelsFor,
+  parseAffordableMaxTokens,
   suggestedModelFromError,
   type LlmProvider
 } from '@/lib/llm/models';
@@ -25,6 +28,7 @@ export interface ChatRequest {
   temperature?: number;
   prefer?: LlmProvider[];
   timeoutMs?: number;
+  maxTokens?: number;
 }
 
 export interface ChatResult {
@@ -49,12 +53,39 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 
 function httpError(status: number, url: string, raw: string, prefix = 'LLM'): Error {
   const snippet = raw.slice(0, 500);
-  const err = new Error(`${prefix} ${url} ${status}: ${snippet}`);
-  (err as Error & { status: number }).status = status;
   if (status === 429) {
     return Object.assign(new Error(`RATE_LIMIT:${snippet}`), { status: 429 });
   }
+  if (status === 402) {
+    return Object.assign(new Error(`CREDITS:${snippet}`), { status: 402 });
+  }
+  const err = new Error(`${prefix} ${url} ${status}: ${snippet}`);
+  (err as Error & { status: number }).status = status;
   return err;
+}
+
+/** Per-process cooldowns so a 402/429 is not re-hammered by the next 9 agents. */
+const cooldownUntil: Partial<Record<LlmProvider, number>> = {};
+
+export function resetLlmCooldowns() {
+  cooldownUntil.openrouter = 0;
+  cooldownUntil.nvidia = 0;
+  cooldownUntil.gemini = 0;
+}
+
+function coolDown(provider: LlmProvider, ms: number) {
+  cooldownUntil[provider] = Date.now() + ms;
+}
+
+function isCooling(provider: LlmProvider): boolean {
+  return Date.now() < (cooldownUntil[provider] || 0);
+}
+
+function resolveMaxTokens(requested?: number): number {
+  const fromEnv = Number(process.env.LLM_MAX_TOKENS || '');
+  const fallback = Number.isFinite(fromEnv) && fromEnv >= 256 ? fromEnv : DEFAULT_MAX_TOKENS;
+  const n = requested ?? fallback;
+  return Math.max(256, Math.min(8192, n));
 }
 
 async function callOpenAICompatible(opts: {
@@ -65,12 +96,15 @@ async function callOpenAICompatible(opts: {
   json?: boolean;
   temperature?: number;
   timeoutMs: number;
+  maxTokens?: number;
   extraHeaders?: Record<string, string>;
 }): Promise<string> {
   const body: Record<string, unknown> = {
     model: opts.model,
     messages: opts.messages,
-    temperature: opts.temperature ?? 0.2
+    temperature: opts.temperature ?? 0.2,
+    // Never omit this — OpenRouter reserves the model's full 65k default and 402s on small balances.
+    max_tokens: resolveMaxTokens(opts.maxTokens)
   };
   if (opts.json) {
     body.response_format = { type: 'json_object' };
@@ -161,7 +195,8 @@ async function callGeminiModel(opts: ChatRequest, model: string): Promise<string
   const url = `${base}/models/${model}:generateContent?key=${apiKey}`;
 
   const generationConfig: Record<string, unknown> = {
-    temperature: opts.temperature ?? 0.2
+    temperature: opts.temperature ?? 0.2,
+    maxOutputTokens: resolveMaxTokens(opts.maxTokens)
   };
   if (opts.json) {
     generationConfig.responseMimeType = 'application/json';
@@ -203,47 +238,79 @@ async function callGeminiModel(opts: ChatRequest, model: string): Promise<string
   }
 }
 
+async function openRouterChat(req: ChatRequest, model: string, maxTokens: number): Promise<string> {
+  const key = env('OPENROUTER_API_KEY');
+  if (!key) throw new Error('OPENROUTER_API_KEY missing');
+  return callOpenAICompatibleWithJsonFallback({
+    url: `${env('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1').replace(/\/$/, '')}/chat/completions`,
+    apiKey: key,
+    model,
+    messages: req.messages,
+    json: req.json,
+    temperature: req.temperature,
+    timeoutMs: req.timeoutMs ?? 60000,
+    maxTokens,
+    extraHeaders: {
+      'HTTP-Referer': env('NEXT_PUBLIC_APP_URL', 'http://localhost:3000'),
+      'X-Title': 'Trading AI AK'
+    }
+  });
+}
+
 export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
   const timeoutMs = req.timeoutMs ?? 60000;
   const order = req.prefer ?? ['openrouter', 'nvidia', 'gemini'];
   const errors: string[] = [];
   const triedModels = new Set<string>();
+  const maxTokens = resolveMaxTokens(req.maxTokens);
 
   for (const provider of order) {
+    if (isCooling(provider)) {
+      errors.push(`${provider}: cooling down after credits/rate-limit`);
+      continue;
+    }
     try {
       if (provider === 'openrouter') {
-        const key = env('OPENROUTER_API_KEY');
-        if (!key) throw new Error('OPENROUTER_API_KEY missing');
+        if (!env('OPENROUTER_API_KEY')) throw new Error('OPENROUTER_API_KEY missing');
         const models = modelsFor('openrouter');
         let last: unknown;
         for (const model of models) {
           if (triedModels.has(`openrouter:${model}`)) continue;
           triedModels.add(`openrouter:${model}`);
           try {
-            const content = await callOpenAICompatibleWithJsonFallback({
-              url: `${env('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1').replace(/\/$/, '')}/chat/completions`,
-              apiKey: key,
-              model,
-              messages: req.messages,
-              json: req.json,
-              temperature: req.temperature,
-              timeoutMs,
-              extraHeaders: {
-                'HTTP-Referer': env('NEXT_PUBLIC_APP_URL', 'http://localhost:3000'),
-                'X-Title': 'Trading AI AK'
-              }
-            });
+            const content = await openRouterChat(req, model, maxTokens);
             return { content, provider: 'openrouter', model };
           } catch (err) {
             last = err;
             const message = err instanceof Error ? err.message : String(err);
             errors.push(`openrouter/${model}: ${message}`);
+            if (isCreditError(message)) {
+              const afford = parseAffordableMaxTokens(message);
+              const nextCap = afford ? Math.max(256, Math.min(maxTokens, afford - 64)) : Math.min(2048, maxTokens);
+              if (nextCap < maxTokens) {
+                try {
+                  const content = await openRouterChat(req, model, nextCap);
+                  return { content, provider: 'openrouter', model };
+                } catch (retryErr) {
+                  const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+                  errors.push(`openrouter/${model}@${nextCap}: ${retryMsg}`);
+                  last = retryErr;
+                  if (isCreditError(retryMsg)) {
+                    coolDown('openrouter', 120_000);
+                    break;
+                  }
+                }
+              } else {
+                coolDown('openrouter', 120_000);
+                break;
+              }
+            }
             if (isRateLimitError(message)) {
+              coolDown('openrouter', 45_000);
               await new Promise((r) => setTimeout(r, 1500));
-              continue;
+              break;
             }
             if (isPermanentLlmError(message)) continue;
-            continue;
           }
         }
         if (last) throw last;
@@ -259,7 +326,6 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
           if (triedModels.has(`nvidia:${model}`)) continue;
           triedModels.add(`nvidia:${model}`);
           try {
-            // NVIDIA MiniMax often rejects response_format=json_object.
             const content = await callOpenAICompatible({
               url: `${env('NVIDIA_BASE_URL', 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '')}/chat/completions`,
               apiKey: key,
@@ -267,7 +333,8 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
               messages: req.messages,
               json: false,
               temperature: req.temperature,
-              timeoutMs
+              timeoutMs,
+              maxTokens
             });
             return { content, provider: 'nvidia', model };
           } catch (err) {
@@ -275,10 +342,10 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
             const message = err instanceof Error ? err.message : String(err);
             errors.push(`nvidia/${model}: ${message}`);
             if (isRateLimitError(message)) {
+              coolDown('nvidia', 45_000);
               await new Promise((r) => setTimeout(r, 1500));
-              continue;
+              break;
             }
-            continue;
           }
         }
         if (last) throw last;
@@ -293,7 +360,7 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
           if (triedModels.has(`gemini:${model}`)) continue;
           triedModels.add(`gemini:${model}`);
           try {
-            const content = await callGeminiModel(req, model);
+            const content = await callGeminiModel({ ...req, maxTokens }, model);
             return { content, provider: 'gemini', model };
           } catch (err) {
             last = err;
@@ -304,10 +371,10 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
               models.push(suggested);
             }
             if (isRateLimitError(message)) {
+              coolDown('gemini', 60_000);
               await new Promise((r) => setTimeout(r, 1500));
-              continue;
+              break;
             }
-            continue;
           }
         }
         if (last) throw last;
@@ -333,4 +400,4 @@ export async function chatJson<T = unknown>(req: ChatRequest): Promise<{ data: T
   return { ...result, data };
 }
 
-export { isPermanentLlmError, isRateLimitError, modelsFor };
+export { isCreditError, isPermanentLlmError, isRateLimitError, modelsFor };

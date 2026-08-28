@@ -45,6 +45,8 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 
 > ⚠ Gemini 2.0 Flash (`gemini-2.0-flash`, `google/gemini-2.0-flash-001`) is **retired**. If your `.env.local` still points at those ids the client skips them and uses Gemini 3.6 / 3.5 / 2.5 Flash instead. A failed council run (all agents `fallback`) is **not** frozen for replay, so you can re-run after keys/models recover.
 >
+> ⚠ OpenRouter **402** (`requested up to 65536 tokens, but can only afford N`) is a **credit reservation** bug if `max_tokens` is omitted. The client now always sends `max_tokens` (default 4096 via `LLM_MAX_TOKENS`). Gemini/NVIDIA **429** trips a short cooldown so the next agents do not keep burning the free-tier quota. Add OpenRouter credits if the balance is actually empty.
+>
 > ⚠ The `MINIMAX_API_KEY` shipped in the original spec appears to contain an embedded `Bearer` prefix (copy artifact). It is unused today; fix it in your key registry if you plan to route MiniMax directly.
 
 **Hard guard:** if the screenshot yields no usable data (UNKNOWN symbol, no price, 0 parse confidence) **and** all three feeds fail, the pipeline returns `DATA_UNAVAILABLE` immediately — the 10 agents and the judge are never asked to analyze nothing.

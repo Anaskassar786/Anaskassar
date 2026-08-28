@@ -83,6 +83,7 @@ export async function parseChartScreenshot(base64Image: string, mimeType = 'imag
       prefer: ['openrouter', 'gemini', 'nvidia'],
       json: true,
       timeoutMs: 45000,
+      maxTokens: 2048,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         {

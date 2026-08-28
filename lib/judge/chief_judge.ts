@@ -140,6 +140,7 @@ Return ONLY valid JSON:
       json: true,
       temperature: 0.2,
       timeoutMs: 70000,
+      maxTokens: 4096,
       messages: [
         { role: 'system', content: judgeSystemPrompt },
         { role: 'user', content: JSON.stringify(userPayload) }

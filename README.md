@@ -11,7 +11,7 @@ User screenshot + risk inputs
         → Phase 0  Vision OCR (symbol, TF, price)
         → Phase 1  Immutable freeze (Twelve Data, FRED, News)
         → HARD GUARD: zero data (feeds + vision) → DATA_UNAVAILABLE, council never runs
-        → Phase 2  10 isolated specialists (2/batch + 3s delay)
+        → Phase 2  10 isolated specialists (NVIDIA NIM, 1 at a time + 4s stagger)
         → Phase 3  Bull vs Bear adversarial debate
         → Phase 4  11th Chief Judge + position sizing
         → Terminal dashboard + session storage
@@ -33,15 +33,19 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 
 | Variable | Used by | If missing |
 | --- | --- | --- |
-| `OPENROUTER_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Phase 0 vision (primary), 10 agents, debate — OpenRouter/Gemini 3.6+ | Retired Gemini 2.0 ids are skipped automatically; remaining catalog models then other providers are tried. If every LLM fails, agents return explicit `NO_TRADE` / `INSUFFICIENT` |
-| `GEMINI_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Vision fallback + LLM failover (native Gemini API, default `gemini-3.6-flash`) | Next catalog model is tried; 404 bodies that name a replacement model are honoured |
-| `NVIDIA_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | **Default for everything** — vision, 10 agents, debate, Chief Judge (MiniMax NIM) | Set `LLM_PROVIDER_ORDER=nvidia` (default). Add `,openrouter,gemini` only if you want failover |
-| `MINIMAX_API_KEY` / `MINIMAX_DEFAULT_MODEL` | Reserved (MiniMax is currently routed via NVIDIA) | Unused |
+| `NVIDIA_API_KEY` | **Required for council** — vision, 10 agents, debate, Chief Judge | All LLM calls fail honest `NO_TRADE` / `INSUFFICIENT` |
+| `NVIDIA_BASE_URL` | NVIDIA OpenAI-compatible host | Defaults to `https://integrate.api.nvidia.com/v1` |
+| `NVIDIA_DEFAULT_MODEL` | NIM model id | Defaults to `minimaxai/minimax-m3` |
+| `LLM_PROVIDER_ORDER` | Which LLM backends run, in order | Defaults to `nvidia` only. Optional: `nvidia,openrouter,gemini` |
+| `LLM_MAX_TOKENS` | Completion cap (stops OpenRouter 65k/402 reservation) | Defaults to `4096` |
+| `OPENROUTER_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Optional failover only if listed in `LLM_PROVIDER_ORDER` | Ignored when order is `nvidia` |
+| `GEMINI_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Optional failover only if listed in `LLM_PROVIDER_ORDER` | Ignored when order is `nvidia` |
+| `MINIMAX_API_KEY` / `MINIMAX_DEFAULT_MODEL` | Reserved (MiniMax is routed via NVIDIA) | Unused |
 | `TWELVE_DATA_API_KEY` (+ `_BASE_URL`) | Market candles (Phase 1 freeze) | `DATA_UNAVAILABLE` market feed |
 | `FRED_API_KEY` (+ `_BASE_URL`) | Macro — FEDFUNDS (Phase 1 freeze) | `DATA_UNAVAILABLE` macro feed |
 | `NEWS_API_KEY` (+ `_BASE_URL`) | Headlines (Phase 1 freeze) | `DATA_UNAVAILABLE` news feed |
-| `NEXT_PUBLIC_APP_URL` | OpenRouter `HTTP-Referer` header, app base URL | Defaults to `http://localhost:3000` |
-| `DATABASE_URL` | **Optional / reserved** — this checkout persists to the file store under `data/`. If you prefer Supabase/Postgres, run `lib/db/schema.sql` and use your own store | File store is used; terminal works with zero external services |
+| `NEXT_PUBLIC_APP_URL` | App base URL (and OpenRouter referer if enabled) | Defaults to `http://localhost:3000` |
+| `DATABASE_URL` | **Optional / reserved** — this checkout persists to the file store under `data/` | File store is used |
 
 > ⚠ Gemini 2.0 Flash (`gemini-2.0-flash`, `google/gemini-2.0-flash-001`) is **retired**. If your `.env.local` still points at those ids the client skips them and uses Gemini 3.6 / 3.5 / 2.5 Flash instead. A failed council run (all agents `fallback`) is **not** frozen for replay, so you can re-run after keys/models recover.
 >
@@ -74,9 +78,9 @@ Sessions are frozen as JSON snapshots under `data/sessions/` (+ `data/index.json
 | `lib/vision/processor.ts` | Phase 0 chart OCR |
 | `lib/data/ingestion.ts` | Twelve Data / FRED / News (no mocks) |
 | `lib/agents/definitions.ts` | 10 specialist prompts |
-| `lib/execution/runner.ts` | Rate-limited isolated batch runner (2/batch + 3s, 429 backoff) |
-| `lib/llm/models.ts` | Live model catalogs; retired Gemini 2.0 ids are never called |
-| `lib/llm/client.ts` | Multi-provider LLM client (openrouter → nvidia → gemini) with per-provider model fallback |
+| `lib/execution/runner.ts` | NVIDIA-friendly runner (1 agent at a time + 4s, 429 wait) |
+| `lib/llm/models.ts` | Live model catalogs; retired Gemini 2.0 ids are never called; `providerOrder()` |
+| `lib/llm/client.ts` | LLM client — default NVIDIA NIM, optional OpenRouter/Gemini failover |
 | `lib/llm/json.ts` | Robust JSON extraction + normalization |
 | `lib/debate/engine.ts` | Round 2 debate |
 | `lib/judge/chief_judge.ts` | 11th judge |

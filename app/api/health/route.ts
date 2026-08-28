@@ -3,6 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fetchFredMacroData, fetchMarketNews, fetchTwelveData } from '@/lib/data/ingestion';
 import { appendHealthLog, listHealthLogs } from '@/lib/db/store';
+import { modelsFor } from '@/lib/llm/models';
 
 export const dynamic = 'force-dynamic';
 
@@ -140,6 +141,11 @@ export async function GET() {
     mode: 'NO-FAKE-DATA STRICT',
     execution: 'DISABLED',
     overall: fails === 0 ? 'READY' : 'DEGRADED',
+    models: {
+      openrouter: modelsFor('openrouter'),
+      gemini: modelsFor('gemini'),
+      nvidia: modelsFor('nvidia')
+    },
     probes,
     history: history.slice(0, 20)
   });

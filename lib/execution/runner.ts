@@ -1,6 +1,6 @@
 import { AGENT_DEFINITIONS } from '@/lib/agents/definitions';
 import { AgentOutputSchema, AgentOutput, VisionParserOutput } from '@/types/analysis';
-import { chatJson } from '@/lib/llm/client';
+import { chatJson, isPermanentLlmError, isRateLimitError } from '@/lib/llm/client';
 import {
   asStringArray,
   clamp,
@@ -161,7 +161,11 @@ Perform your specialist Round 1 analysis independently. You cannot see other age
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       attempt++;
-      const backoffMs = lastError.includes('RATE_LIMIT') ? Math.pow(2, attempt) * 2000 : 2000;
+      // 404 / retired-model / missing-key failures will not heal on retry.
+      if (isPermanentLlmError(lastError) && !isRateLimitError(lastError)) {
+        break;
+      }
+      const backoffMs = isRateLimitError(lastError) ? Math.pow(2, attempt) * 2000 : 2000;
       if (attempt < retries) {
         await new Promise((r) => setTimeout(r, backoffMs));
       }

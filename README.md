@@ -33,8 +33,8 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 
 | Variable | Used by | If missing |
 | --- | --- | --- |
-| `OPENROUTER_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Phase 0 vision (primary), 10 agents, debate — OpenRouter/Gemini | Fallback providers are tried automatically; if all LLM providers fail, agents return explicit `NO_TRADE` / `INSUFFICIENT` and the judge fails honestly |
-| `GEMINI_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Vision fallback + LLM failover (native Gemini API) | Vision falls back to OpenRouter only |
+| `OPENROUTER_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Phase 0 vision (primary), 10 agents, debate — OpenRouter/Gemini 3.6+ | Retired Gemini 2.0 ids are skipped automatically; remaining catalog models then other providers are tried. If every LLM fails, agents return explicit `NO_TRADE` / `INSUFFICIENT` |
+| `GEMINI_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Vision fallback + LLM failover (native Gemini API, default `gemini-3.6-flash`) | Next catalog model is tried; 404 bodies that name a replacement model are honoured |
 | `NVIDIA_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Chief Judge (MiniMax via NVIDIA OpenAI-compatible endpoint) | Judge falls back to OpenRouter/Gemini per provider chain |
 | `MINIMAX_API_KEY` / `MINIMAX_DEFAULT_MODEL` | Reserved (MiniMax is currently routed via NVIDIA) | Unused |
 | `TWELVE_DATA_API_KEY` (+ `_BASE_URL`) | Market candles (Phase 1 freeze) | `DATA_UNAVAILABLE` market feed |
@@ -43,6 +43,8 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 | `NEXT_PUBLIC_APP_URL` | OpenRouter `HTTP-Referer` header, app base URL | Defaults to `http://localhost:3000` |
 | `DATABASE_URL` | **Optional / reserved** — this checkout persists to the file store under `data/`. If you prefer Supabase/Postgres, run `lib/db/schema.sql` and use your own store | File store is used; terminal works with zero external services |
 
+> ⚠ Gemini 2.0 Flash (`gemini-2.0-flash`, `google/gemini-2.0-flash-001`) is **retired**. If your `.env.local` still points at those ids the client skips them and uses Gemini 3.6 / 3.5 / 2.5 Flash instead. A failed council run (all agents `fallback`) is **not** frozen for replay, so you can re-run after keys/models recover.
+>
 > ⚠ The `MINIMAX_API_KEY` shipped in the original spec appears to contain an embedded `Bearer` prefix (copy artifact). It is unused today; fix it in your key registry if you plan to route MiniMax directly.
 
 **Hard guard:** if the screenshot yields no usable data (UNKNOWN symbol, no price, 0 parse confidence) **and** all three feeds fail, the pipeline returns `DATA_UNAVAILABLE` immediately — the 10 agents and the judge are never asked to analyze nothing.
@@ -71,7 +73,8 @@ Sessions are frozen as JSON snapshots under `data/sessions/` (+ `data/index.json
 | `lib/data/ingestion.ts` | Twelve Data / FRED / News (no mocks) |
 | `lib/agents/definitions.ts` | 10 specialist prompts |
 | `lib/execution/runner.ts` | Rate-limited isolated batch runner (2/batch + 3s, 429 backoff) |
-| `lib/llm/client.ts` | Multi-provider LLM client (openrouter → nvidia → gemini failover) |
+| `lib/llm/models.ts` | Live model catalogs; retired Gemini 2.0 ids are never called |
+| `lib/llm/client.ts` | Multi-provider LLM client (openrouter → nvidia → gemini) with per-provider model fallback |
 | `lib/llm/json.ts` | Robust JSON extraction + normalization |
 | `lib/debate/engine.ts` | Round 2 debate |
 | `lib/judge/chief_judge.ts` | 11th judge |

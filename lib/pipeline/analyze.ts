@@ -53,6 +53,23 @@ export interface AnalysisApiResult {
   screenshotUrl: string;
 }
 
+function isReusableFrozenSession(existing: AnalysisSessionRecord): boolean {
+  if (existing.status !== 'COMPLETED') return false;
+  const judge = existing.final_decision;
+  if (!judge) return false;
+  const judgeModel = (judge as { chief_judge_model?: string; provider_used?: string }).chief_judge_model;
+  const judgeProvider = (judge as { provider_used?: string }).provider_used;
+  if (judge.data_quality === 'INSUFFICIENT' && (judgeModel === 'fallback' || judgeProvider === 'none')) {
+    return false;
+  }
+  const agents = existing.agent_analyses || [];
+  if (agents.length === 0) return false;
+  const failed = agents.filter((a) => a.provider_used === 'none' || a.model_used === 'fallback').length;
+  if (failed === agents.length) return false;
+  if (failed >= 8) return false;
+  return true;
+}
+
 function extFromMime(mime: string): string {
   if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg';
   if (mime.includes('webp')) return 'webp';
@@ -68,7 +85,9 @@ export async function runAnalysisPipeline(
 
   if (input.reuseFrozen !== false) {
     const existing = await findCompletedByHash(screenshotHash);
-    if (existing && existing.final_decision && existing.debate) {
+    // Only replay sessions that actually produced a live analysis.
+    // Fallback NO_TRADE from dead LLM models must NOT lock the user out of a retry.
+    if (existing && existing.final_decision && existing.debate && isReusableFrozenSession(existing)) {
       const result: AnalysisApiResult = {
         success: true,
         sessionId: existing.id,
@@ -269,8 +288,8 @@ export async function runAnalysisPipeline(
   await upsertSession(record);
 
   const result: AnalysisApiResult = {
-    success: true,
-    status: 'COMPLETED',
+    success: !dataUnavailable,
+    status: dataUnavailable ? 'DATA_UNAVAILABLE' : 'COMPLETED',
     sessionId,
     reusedFrozenSession: false,
     timeframeMismatchWarning: timeframeMismatch,

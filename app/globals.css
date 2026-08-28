@@ -69,3 +69,18 @@ input[type='number']::-webkit-outer-spin-button {
 .live-dot {
   animation: pulse-dot 1.6s ease-in-out infinite;
 }
+
+.field {
+  width: 100%;
+  font-size: 12px;
+  background: #020617;
+  border: 1px solid #1e293b;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  color: #e2e8f0;
+  outline: none;
+}
+
+.field:focus {
+  border-color: #10b981;
+}

@@ -35,7 +35,7 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Phase 0 vision (primary), 10 agents, debate — OpenRouter/Gemini 3.6+ | Retired Gemini 2.0 ids are skipped automatically; remaining catalog models then other providers are tried. If every LLM fails, agents return explicit `NO_TRADE` / `INSUFFICIENT` |
 | `GEMINI_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`, `_FALLBACK_MODELS`) | Vision fallback + LLM failover (native Gemini API, default `gemini-3.6-flash`) | Next catalog model is tried; 404 bodies that name a replacement model are honoured |
-| `NVIDIA_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | Chief Judge (MiniMax via NVIDIA OpenAI-compatible endpoint) | Judge falls back to OpenRouter/Gemini per provider chain |
+| `NVIDIA_API_KEY` (+ `_BASE_URL`, `_DEFAULT_MODEL`) | **Default for everything** — vision, 10 agents, debate, Chief Judge (MiniMax NIM) | Set `LLM_PROVIDER_ORDER=nvidia` (default). Add `,openrouter,gemini` only if you want failover |
 | `MINIMAX_API_KEY` / `MINIMAX_DEFAULT_MODEL` | Reserved (MiniMax is currently routed via NVIDIA) | Unused |
 | `TWELVE_DATA_API_KEY` (+ `_BASE_URL`) | Market candles (Phase 1 freeze) | `DATA_UNAVAILABLE` market feed |
 | `FRED_API_KEY` (+ `_BASE_URL`) | Macro — FEDFUNDS (Phase 1 freeze) | `DATA_UNAVAILABLE` macro feed |

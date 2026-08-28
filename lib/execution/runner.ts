@@ -82,8 +82,9 @@ export async function executeAgentBatch(
   onProgress?: (agentNumber: number, status: string, output?: AgentOutput, meta?: AgentRunMeta) => void
 ): Promise<Array<AgentOutput & AgentRunMeta>> {
   const results: Array<AgentOutput & AgentRunMeta> = [];
-  const BATCH_SIZE = 2;
-  const DELAY_BETWEEN_BATCHES_MS = 6000;
+  // NVIDIA free NIM rate-limits parallel bursts. One agent at a time.
+  const BATCH_SIZE = 1;
+  const DELAY_BETWEEN_BATCHES_MS = 4000;
 
   for (let i = 0; i < AGENT_DEFINITIONS.length; i += BATCH_SIZE) {
     const batch = AGENT_DEFINITIONS.slice(i, i + BATCH_SIZE);
@@ -157,7 +158,6 @@ Perform your specialist Round 1 analysis independently. You cannot see other age
       }
 
       const { data, provider, model } = await chatJson<Record<string, unknown>>({
-        prefer: ['openrouter', 'nvidia', 'gemini'],
         json: true,
         temperature: 0.15,
         timeoutMs: 55000,

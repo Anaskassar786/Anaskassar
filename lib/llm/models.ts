@@ -156,6 +156,18 @@ export function parseAffordableMaxTokens(message: string): number | null {
 
 export const DEFAULT_MAX_TOKENS = 4096;
 
+const PROVIDERS: LlmProvider[] = ['nvidia', 'openrouter', 'gemini'];
+
+/**
+ * Default is NVIDIA-only (free NIM key). Override with
+ * LLM_PROVIDER_ORDER=nvidia,openrouter,gemini if you want failover.
+ */
+export function providerOrder(): LlmProvider[] {
+  const raw = unique(csv(env('LLM_PROVIDER_ORDER', 'nvidia')));
+  const parsed = raw.filter((p): p is LlmProvider => (PROVIDERS as string[]).includes(p));
+  return parsed.length ? parsed : ['nvidia'];
+}
+
 export function isJsonModeError(message: string): boolean {
   const m = message.toLowerCase();
   return (

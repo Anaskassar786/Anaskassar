@@ -79,7 +79,6 @@ Return JSON strictly:
       bearCounterargument?: string;
       synthesisConclusion?: string;
     }>({
-      prefer: ['openrouter', 'nvidia', 'gemini'],
       json: true,
       temperature: 0.3,
       timeoutMs: 45000,

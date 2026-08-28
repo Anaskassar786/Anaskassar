@@ -8,6 +8,7 @@ import {
   isRetiredModel,
   modelsFor,
   parseAffordableMaxTokens,
+  providerOrder,
   suggestedModelFromError,
   type LlmProvider
 } from '@/lib/llm/models';
@@ -77,8 +78,11 @@ function coolDown(provider: LlmProvider, ms: number) {
   cooldownUntil[provider] = Date.now() + ms;
 }
 
-function isCooling(provider: LlmProvider): boolean {
-  return Date.now() < (cooldownUntil[provider] || 0);
+async function awaitProvider(provider: LlmProvider): Promise<void> {
+  const wait = (cooldownUntil[provider] || 0) - Date.now();
+  if (wait > 0) {
+    await new Promise((r) => setTimeout(r, Math.min(wait, 90_000)));
+  }
 }
 
 function resolveMaxTokens(requested?: number): number {
@@ -259,16 +263,13 @@ async function openRouterChat(req: ChatRequest, model: string, maxTokens: number
 
 export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
   const timeoutMs = req.timeoutMs ?? 60000;
-  const order = req.prefer ?? ['openrouter', 'nvidia', 'gemini'];
+  const order = req.prefer ?? providerOrder();
   const errors: string[] = [];
   const triedModels = new Set<string>();
   const maxTokens = resolveMaxTokens(req.maxTokens);
 
   for (const provider of order) {
-    if (isCooling(provider)) {
-      errors.push(`${provider}: cooling down after credits/rate-limit`);
-      continue;
-    }
+    await awaitProvider(provider);
     try {
       if (provider === 'openrouter') {
         if (!env('OPENROUTER_API_KEY')) throw new Error('OPENROUTER_API_KEY missing');
@@ -306,7 +307,7 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
               }
             }
             if (isRateLimitError(message)) {
-              coolDown('openrouter', 45_000);
+              coolDown('openrouter', 12_000);
               await new Promise((r) => setTimeout(r, 1500));
               break;
             }
@@ -342,8 +343,8 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
             const message = err instanceof Error ? err.message : String(err);
             errors.push(`nvidia/${model}: ${message}`);
             if (isRateLimitError(message)) {
-              coolDown('nvidia', 45_000);
-              await new Promise((r) => setTimeout(r, 1500));
+              coolDown('nvidia', 8_000);
+              await new Promise((r) => setTimeout(r, 8000));
               break;
             }
           }
@@ -371,7 +372,7 @@ export async function chatCompletion(req: ChatRequest): Promise<ChatResult> {
               models.push(suggested);
             }
             if (isRateLimitError(message)) {
-              coolDown('gemini', 60_000);
+              coolDown('gemini', 12_000);
               await new Promise((r) => setTimeout(r, 1500));
               break;
             }

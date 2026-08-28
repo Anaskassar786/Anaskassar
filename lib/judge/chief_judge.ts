@@ -136,7 +136,6 @@ Return ONLY valid JSON:
 
   try {
     const { data, provider, model } = await chatJson<Record<string, unknown>>({
-      prefer: ['nvidia', 'openrouter', 'gemini'],
       json: true,
       temperature: 0.2,
       timeoutMs: 70000,

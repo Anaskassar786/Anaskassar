@@ -80,7 +80,6 @@ function normalizeSymbol(raw: unknown): string {
 export async function parseChartScreenshot(base64Image: string, mimeType = 'image/png'): Promise<VisionParserOutput> {
   try {
     const { data } = await chatJson<Record<string, unknown>>({
-      prefer: ['openrouter', 'gemini', 'nvidia'],
       json: true,
       timeoutMs: 45000,
       maxTokens: 2048,

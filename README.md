@@ -87,6 +87,8 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 | `LLM_MAX_COOLDOWN_MS` | Ceiling for a single provider cooldown | `120000` |
 | `LLM_OUTAGE_THRESHOLD` | Consecutive provider faults before the breaker opens | `3` |
 | `LLM_RUN_BUDGET_MS` | Wall-clock budget for all LLM work in a run | `240000` (keep below route `maxDuration`) |
+| `LLM_AGENT_BATCH_SIZE` | Specialists answered per request (the main free-tier 429 defence) | `5` → 10 agents in **3 requests**. `1` = legacy one-call-per-agent |
+| `LLM_RATE_LIMIT_RECOVERY` / `_MS` | Wait out a quoted `Retry-After` once and retry the batch instead of declaring an outage | `on` / `75000` |
 | `LLM_AGENT_MAX_TOKENS`, `LLM_AGENT_TIMEOUT_MS`, `LLM_MARKET_CANDLES`, `LLM_NEWS_ITEMS` | Per-specialist request shape | `2048`, `55000`, `12`, `5` |
 | `LLM_AGENTS_ATTACH_CHART` | Send the screenshot to the 8 chart agents | `true`; `false` = text-only council during a quota crunch |
 | `LLM_IMAGE_MAX_BYTES` | Above this, specialists run text-only instead of blowing the token budget | `1500000` |
@@ -109,13 +111,27 @@ All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PU
 
 > 🔐 **Secrets hygiene.** `.env.local` is gitignored and untracked. If it was ever committed, assume every key in it is public: rotate the NVIDIA / Twelve Data / FRED / News API keys, and purge the blob from history (`git filter-repo --path .env.local --invert-paths`) before making the repo visible.
 
+## Request budget: why the council is batched
+
+A run used to need **12+ completions** (1 vision + 10 specialists + debate + judge). No free tier grants that per minute, so the first 429 cascaded: agent 2 failed, the breaker tripped, 8 agents were never sent and the terminal reported `COUNCIL OFFLINE — 10/10`.
+
+Specialists are independent *analysts*, not independent *requests*. `LLM_AGENT_BATCH_SIZE=5` carries several fenced briefs in one call and gets one JSON verdict back per specialist:
+
+| Mode | Requests per run | Notes |
+| --- | --- | --- |
+| `LLM_AGENT_BATCH_SIZE=1` (legacy) | 10 + vision + debate + judge | one 429 kills the council |
+| `LLM_AGENT_BATCH_SIZE=5` (**default**) | 3 + vision + debate + judge | chart batches carry the image, macro/news batch never does |
+| `LLM_AGENT_BATCH_SIZE=10` | 2 + vision + debate + judge | tightest quota; watch for truncated answers |
+
+Isolation is preserved: briefs are fenced, the model is told **not** to reconcile the specialists, and answers are mapped back by `agent_number`. A specialist the model omits is recorded `OFFLINE` / `EMPTY` — never back-filled from a sibling's levels. On a 429 the batch waits out the provider's own quoted window **once** (`LLM_RATE_LIMIT_RECOVERY`) before anything is called an outage.
+
 ## When a run comes back `PROVIDER_OUTAGE`
 
 This is a deliberately **non-decision**: it means no specialist reached a model, so there was nothing to judge. It is *not* a NO_TRADE verdict, offline agents are *not* votes, and the run is never frozen for replay — re-run the same screenshot once the provider recovers.
 
 | Symptom | Meaning | Do this |
 | --- | --- | --- |
-| `RATE_LIMIT` on one provider, others keyed | free-tier window exhausted | already handled — the client fails over; also drop `LLM_IMAGE_MAX_BYTES` / set `LLM_AGENTS_ATTACH_CHART=false` |
+| `RATE_LIMIT` on one provider, others keyed | free-tier window exhausted | already handled — the council is batched (3 requests, not 10), waits out one quoted `Retry-After`, then fails over. Cut further with `LLM_AGENT_BATCH_SIZE=10` or `LLM_AGENTS_ATTACH_CHART=false` |
 | `RATE_LIMIT`, only one provider keyed | a single key gates the whole terminal | add `OPENROUTER_API_KEY` or `GEMINI_API_KEY`, or set `LLM_PROVIDER_ORDER=nvidia,openrouter,gemini` |
 | `MISSING_KEY` / `AUTH` | no key / rejected key | `GET /api/health` names the broken key; `?probe=1` spends 1 token per provider to test quota too |
 | `CREDITS` (OpenRouter 402) | balance below the reservation | lower `LLM_MAX_TOKENS`, top up, or move to a keyed free tier |

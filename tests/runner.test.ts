@@ -17,6 +17,9 @@ const ENV_KEYS = [
   'LLM_AGENT_GAP_MS',
   'LLM_IMAGE_MAX_BYTES',
   'LLM_AGENTS_ATTACH_CHART',
+  'LLM_AGENT_BATCH_SIZE',
+  'LLM_RATE_LIMIT_RECOVERY',
+  'LLM_RATE_LIMIT_RECOVERY_MS',
   'NVIDIA_API_KEY',
   'NVIDIA_BASE_URL',
   'NVIDIA_DEFAULT_MODEL'
@@ -96,6 +99,9 @@ beforeEach(() => {
   process.env.LLM_MAX_ATTEMPTS = '1';
   process.env.LLM_RUN_BUDGET_MS = '0';
   process.env.LLM_AGENT_GAP_MS = '0';
+  // Batching + recovery are the production defaults; individual tests opt in.
+  process.env.LLM_AGENT_BATCH_SIZE = '1';
+  process.env.LLM_RATE_LIMIT_RECOVERY = 'off';
   realFetch = globalThis.fetch;
 });
 
@@ -175,5 +181,99 @@ describe('executeAgentBatch under a provider outage', () => {
     assert.equal(batch.outputs.length, 10);
     assert.equal(batch.skippedAgents, 10);
     assert.match(batch.outputs[0].evidence[0], /LLM_RUN_BUDGET_EXHAUSTED|never ran/);
+  });
+});
+
+function batchedAnswer(numbers: number[], decision = 'BUY') {
+  return {
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            agents: numbers.map((n) => ({
+              agent_number: n,
+              decision,
+              confidence: 50 + n,
+              data_quality: 'MEDIUM',
+              evidence: [`agent ${n} evidence`],
+              entry_zone: { low: 4500, high: 4510 },
+              stop_loss: 4480
+            }))
+          })
+        }
+      }
+    ]
+  };
+}
+
+describe('batched council (the free-tier 429 fix)', () => {
+  it('runs all 10 specialists in 3 requests instead of 10', async () => {
+    process.env.LLM_AGENT_BATCH_SIZE = '5';
+    stub((body) => {
+      const wanted = [...body.matchAll(/AGENT (\d+) —/g)].map((m) => Number(m[1]));
+      return { status: 200, payload: batchedAnswer([...new Set(wanted)]) };
+    });
+
+    const batch = await executeAgentBatch(payload());
+
+    // 8 chart-reading specialists (5 + 3) + 1 text-only batch = 3 requests.
+    assert.equal(requests.length, 3, `batched council must cost 3 requests, saw ${requests.length}`);
+    assert.equal(liveAgentCount(batch.outputs), 10, 'every specialist still produces a live verdict');
+    assert.deepEqual(batch.outputs.map((o) => o.agent_number), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.equal(voteCountOf(batch.outputs).buy, 10);
+    assert.equal(voteCountOf(batch.outputs).offline, 0);
+  });
+
+  it('never attaches the screenshot to the macro/news batch', async () => {
+    process.env.LLM_AGENT_BATCH_SIZE = '5';
+    stub((body) => {
+      const wanted = [...body.matchAll(/AGENT (\d+) —/g)].map((m) => Number(m[1]));
+      return { status: 200, payload: batchedAnswer([...new Set(wanted)]) };
+    });
+
+    await executeAgentBatch(payload());
+    const imaged = requests.filter((r) => r.body.includes('image_url'));
+    assert.equal(imaged.length, 2, 'only the chart-reading batches carry the image');
+    const textOnly = requests.find((r) => !r.body.includes('image_url'));
+    assert.ok(textOnly && /AGENT 8 —/.test(textOnly.body) && /AGENT 9 —/.test(textOnly.body));
+  });
+
+  it('records a specialist the model forgot as OFFLINE instead of copying a sibling', async () => {
+    process.env.LLM_AGENT_BATCH_SIZE = '5';
+    stub((body) => {
+      const wanted = [...new Set([...body.matchAll(/AGENT (\d+) —/g)].map((m) => Number(m[1])))];
+      return { status: 200, payload: batchedAnswer(wanted.filter((n) => n !== 3)) };
+    });
+
+    const batch = await executeAgentBatch(payload());
+    const a3 = batch.outputs.find((o) => o.agent_number === 3)!;
+    assert.equal(a3.execution_state, 'OFFLINE');
+    assert.equal(a3.error_class, 'EMPTY');
+    assert.equal(a3.stop_loss, null, 'nothing may be back-filled from another specialist');
+    assert.equal(liveAgentCount(batch.outputs), 9);
+    assert.match(batch.batchWarnings.join(' '), /omitted agent/i);
+  });
+
+  it('waits out the quoted Retry-After once and completes the council', async () => {
+    process.env.LLM_AGENT_BATCH_SIZE = '5';
+    process.env.LLM_RATE_LIMIT_RECOVERY = 'on';
+    process.env.LLM_RATE_LIMIT_RECOVERY_MS = '1200';
+    process.env.LLM_MAX_COOLDOWN_MS = '50';
+    beginRun(60_000);
+    let first = true;
+    stub((body) => {
+      if (first) {
+        first = false;
+        return { status: 429, payload: { status: 429, title: 'Too Many Requests' } };
+      }
+      const wanted = [...new Set([...body.matchAll(/AGENT (\d+) —/g)].map((m) => Number(m[1])))];
+      return { status: 200, payload: batchedAnswer(wanted, 'SELL') };
+    });
+
+    const batch = await executeAgentBatch(payload());
+
+    assert.equal(liveAgentCount(batch.outputs), 10, 'a single 429 must no longer end the run');
+    assert.equal(voteCountOf(batch.outputs).sell, 10);
+    assert.match(batch.batchWarnings.join(' '), /waited it out once/i);
   });
 });

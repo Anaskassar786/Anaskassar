@@ -216,7 +216,18 @@ export function parseRetryAfterMs(input: {
     if (v == null) return null;
     const s = String(v).trim();
     if (!s) return null;
-    if (/^\d+(\.\d+)?$/.test(s)) return Math.round(Number(s) * 1000);
+    if (/^\d+(\.\d+)?$/.test(s)) {
+      const numeric = Number(s);
+      // x-ratelimit-reset is commonly an epoch timestamp (seconds or
+      // milliseconds), while Retry-After is a delta in seconds. Distinguish
+      // the two so a provider reset at 2026-08-28 is not interpreted as a
+      // 55-year cooldown.
+      if (numeric > 1_000_000_000) {
+        const epochMs = numeric < 100_000_000_000 ? numeric * 1000 : numeric;
+        return Math.max(0, epochMs - now);
+      }
+      return Math.round(numeric * 1000);
+    }
     const date = Date.parse(s);
     if (!Number.isNaN(date)) return Math.max(0, date - now);
     return null;

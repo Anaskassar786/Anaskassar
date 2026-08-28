@@ -553,8 +553,19 @@ export async function probeProvider(provider: LlmProvider, model?: string): Prom
     await (provider === 'openrouter'
       ? openRouterChat({ messages: [{ role: 'user', content: 'Reply with the single word: OK' }], json: false }, target, 256)
       : provider === 'nvidia'
-        ? nvidiaChat({ messages: [{ role: 'user', content: 'Reply with the single word: OK' }] }, target, 256)
-        : callGeminiModel({ messages: [{ role: 'user', content: 'Reply with the single word: OK' }] }, target));
+        ? nvidiaChat(
+            { messages: [{ role: 'user', content: 'Reply with the single word: OK' }], timeoutMs: 15_000 },
+            target,
+            256
+          )
+        : callGeminiModel(
+            {
+              messages: [{ role: 'user', content: 'Reply with the single word: OK' }],
+              timeoutMs: 15_000,
+              maxTokens: 256
+            },
+            target
+          ));
     noteSuccess(provider);
     return { ok: true, model: target };
   } catch (err) {

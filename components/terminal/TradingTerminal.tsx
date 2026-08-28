@@ -23,7 +23,15 @@ type Decision = 'BUY' | 'SELL' | 'NO_TRADE';
  * OFFLINE = no model ever answered for that specialist (provider outage / rate
  * limit) — it is not a vote. SKIPPED_* = never sent, to preserve quota.
  */
-type AgentStatus = 'IDLE' | 'RUNNING' | 'COMPLETED' | 'OFFLINE' | 'SKIPPED_OUTAGE' | 'SKIPPED_BUDGET' | 'FAILED';
+type AgentStatus =
+  | 'IDLE'
+  | 'RUNNING'
+  | 'WAITING_RATE_LIMIT'
+  | 'COMPLETED'
+  | 'OFFLINE'
+  | 'SKIPPED_OUTAGE'
+  | 'SKIPPED_BUDGET'
+  | 'FAILED';
 
 interface AgentOutput {
   agent_number: number;
@@ -280,6 +288,7 @@ export default function TradingTerminal() {
         if (event.type === 'agent') {
           const map: Record<string, AgentStatus> = {
             RUNNING: 'RUNNING',
+            WAITING_RATE_LIMIT: 'WAITING_RATE_LIMIT',
             COMPLETED: 'COMPLETED',
             OFFLINE: 'OFFLINE',
             SKIPPED_OUTAGE: 'SKIPPED_OUTAGE',
@@ -289,6 +298,9 @@ export default function TradingTerminal() {
             ...prev,
             [event.agentNumber]: map[event.status] || (event.status === 'COMPLETED' ? 'COMPLETED' : 'RUNNING')
           }));
+        }
+        if (event.type === 'agent' && event.status === 'WAITING_RATE_LIMIT') {
+          setPhaseLabel('RATE LIMITED — waiting out the provider window, then retrying this batch once');
         }
         if (event.type === 'providers' && event.diagnostics?.council_state === 'OUTAGE') {
           setPhaseLabel('COUNCIL OFFLINE — no request budget was wasted on the remaining specialists');
@@ -559,7 +571,7 @@ export default function TradingTerminal() {
                         className={`text-[10px] text-center rounded py-1.5 border ${
                           st === 'COMPLETED'
                             ? 'border-emerald-700 bg-emerald-950/50 text-emerald-300'
-                            : st === 'RUNNING'
+                            : st === 'RUNNING' || st === 'WAITING_RATE_LIMIT'
                               ? 'border-amber-700 bg-amber-950/40 text-amber-300'
                               : dead
                                 ? 'border-rose-900 bg-rose-950/30 text-rose-300'
@@ -567,7 +579,11 @@ export default function TradingTerminal() {
                         }`}
                       >
                         A{n}
-                        {dead ? <span className="block text-[8px] tracking-tight">{st === 'OFFLINE' ? 'offline' : 'not sent'}</span> : null}
+                        {dead ? (
+                          <span className="block text-[8px] tracking-tight">{st === 'OFFLINE' ? 'offline' : 'not sent'}</span>
+                        ) : st === 'WAITING_RATE_LIMIT' ? (
+                          <span className="block text-[8px] tracking-tight">waiting</span>
+                        ) : null}
                       </div>
                     );
                   })}

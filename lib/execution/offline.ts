@@ -195,6 +195,9 @@ export function remediationFor(errorClass: LlmErrorClass, retryAfterMs: number, 
       out.push(
         `Spread the load: keep ${primary} first but set LLM_PROVIDER_ORDER=${primary},openrouter,gemini and add OPENROUTER_API_KEY / GEMINI_API_KEY so a 429 on one key cannot take the whole council down.`
       );
+      out.push(
+        `Cut request COUNT, which matters more than size on free tiers: LLM_AGENT_BATCH_SIZE=5 runs the 10 specialists in 3 requests instead of 10 (set it to 3 for ~4 requests if answers get truncated).`
+      );
       out.push(`Cut prompt size: smaller screenshots (max LLM_IMAGE_MAX_EDGE=1400) and LLM_AGENTS_ATTACH_CHART=false drop the token count that triggers 429s.`);
       out.push('Tune the governor if the account legitimately allows more: LLM_MAX_ATTEMPTS, LLM_MIN_INTERVAL_MS, LLM_RUN_BUDGET_MS.');
       break;

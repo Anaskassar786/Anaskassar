@@ -2,7 +2,13 @@ import { AGENT_DEFINITIONS } from '@/lib/agents/definitions';
 import { AgentOutputSchema, AgentOutput, VisionParserOutput } from '@/types/analysis';
 import { chatJson, classifyLlmError, isLlmUnavailable, type LlmFailure } from '@/lib/llm/client';
 import type { LlmErrorClass } from '@/lib/llm/models';
-import { isRunBudgetExhausted, snapshot } from '@/lib/llm/rate-limit';
+import { budgetRemainingMs, isRunBudgetExhausted, resetRateLimits, sleep, snapshot } from '@/lib/llm/rate-limit';
+import {
+  buildBatchSystemPrompt,
+  parseBatchResponse,
+  planAgentBatches,
+  type AgentBatchGroup
+} from '@/lib/execution/batching';
 import {
   asStringArray,
   clamp,
@@ -174,92 +180,165 @@ Desired Profit: ${payload.desiredProfit ?? 'NOT_PROVIDED'}
 
 Perform your specialist Round 1 analysis independently. You cannot see other agents. Output pure JSON matching schema.`;
 }
-
-interface AgentCallResult {
-  output: AgentOutput;
-  meta: AgentRunMeta;
+interface GroupCallResult {
+  outputs: Array<AgentOutput & AgentRuntime>;
   failures: LlmFailure[];
-  note?: string;
+  notes: string[];
+  /** Provider-side error class when the whole group failed, 'NONE' otherwise. */
+  errorClass: LlmErrorClass | 'NONE';
+  retryAfterMs: number;
+  provider: string;
 }
 
-async function callSingleAgent(
-  agentDef: (typeof AGENT_DEFINITIONS)[0],
+function offlineGroup(
+  group: AgentBatchGroup,
+  reason: string,
+  errorClass: LlmErrorClass,
+  retryAfterMs: number,
+  modelLabel: string,
+  attempts: number
+): Array<AgentOutput & AgentRuntime> {
+  return group.agents.map((agentDef) => ({
+    ...offlineOutput(agentDef, reason, errorClass, retryAfterMs),
+    provider_used: 'none',
+    model_used: modelLabel,
+    execution_state: 'OFFLINE' as const,
+    error_class: errorClass,
+    attempts,
+    retry_after_ms: retryAfterMs
+  }));
+}
+
+/**
+ * One request carrying every brief in the group.
+ *
+ * A specialist missing from an otherwise valid answer is recorded OFFLINE with
+ * an EMPTY error class — never back-filled from a sibling's numbers.
+ */
+async function callAgentGroup(
+  group: AgentBatchGroup,
   payload: SnapshotPayload,
   opts: { attachChart: boolean; patient: boolean; oversizedImageBytes: number }
-): Promise<AgentCallResult> {
+): Promise<GroupCallResult> {
+  const notes: string[] = [];
+  if (opts.oversizedImageBytes) {
+    notes.push(
+      `chart image ${Math.round(opts.oversizedImageBytes / 1024)}KB exceeds LLM_IMAGE_MAX_BYTES (${Math.round(
+        maxImageBytes() / 1024
+      )}KB) — the screenshot was dropped to protect the token budget`
+    );
+  }
+
+  const single = group.agents.length === 1;
+  const systemPrompt = single ? group.agents[0].systemPrompt : buildBatchSystemPrompt(group);
+  const instruction = single
+    ? 'Perform your specialist Round 1 analysis independently. You cannot see other agents. Output pure JSON matching schema.'
+    : `Answer all ${group.agents.length} specialists (${group.agents
+        .map((a) => `A${a.number}`)
+        .join(', ')}) in one JSON object under "agents". Each specialist reasons independently — do not reconcile them.`;
+
   try {
     const mime = payload.imageMimeType || 'image/png';
-    const userContent: Array<
-      | { type: 'text'; text: string }
-      | { type: 'image_url'; image_url: { url: string } }
-    > = [{ type: 'text', text: buildSnapshotText(payload) }];
+    const userContent: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = [
+      { type: 'text', text: `${buildSnapshotText(payload)}\n\n${instruction}` }
+    ];
     if (opts.attachChart) {
       userContent.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${payload.imageBufferBase64}` } });
     }
 
-    const { data, provider, model } = await chatJson<Record<string, unknown>>({
+    const perAgentTokens = envInt('LLM_AGENT_MAX_TOKENS', 2048);
+    const { data, provider, model } = await chatJson<unknown>({
       json: true,
       temperature: 0.15,
-      timeoutMs: envInt('LLM_AGENT_TIMEOUT_MS', 55000),
-      maxTokens: envInt('LLM_AGENT_MAX_TOKENS', 2048),
+      timeoutMs: envInt('LLM_AGENT_TIMEOUT_MS', 55000) + (single ? 0 : (group.agents.length - 1) * 10_000),
+      // A batch must be able to emit several specialist objects; a cramped
+      // completion window truncates the JSON and loses agents that DID run.
+      maxTokens: Math.min(8192, single ? perAgentTokens : Math.round(perAgentTokens * 0.8 * group.agents.length)),
       patient: opts.patient,
       messages: [
-        { role: 'system', content: agentDef.systemPrompt },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent }
       ]
     });
 
-    return {
-      output: coerceAgentOutput(data, agentDef),
-      meta: {
+    const parsed = parseBatchResponse(data, group);
+    const outputs: Array<AgentOutput & AgentRuntime> = [];
+    for (const agentDef of group.agents) {
+      const raw = parsed.byAgent.get(agentDef.number);
+      if (!raw) {
+        outputs.push(
+          ...offlineGroup(
+            { ...group, agents: [agentDef] },
+            `The model answered this batch but omitted agent ${agentDef.number}; nothing was copied from the other specialists to fill the gap.`,
+            'EMPTY',
+            0,
+            model,
+            1
+          )
+        );
+        continue;
+      }
+      outputs.push({
+        ...coerceAgentOutput(raw, agentDef),
         provider_used: provider,
         model_used: model,
-        execution_state: 'LIVE',
-        error_class: 'NONE',
+        execution_state: 'LIVE' as const,
+        error_class: 'NONE' as const,
         attempts: 1,
         retry_after_ms: 0
-      },
-      failures: [],
-      note: opts.oversizedImageBytes
-        ? `chart image ${Math.round(opts.oversizedImageBytes / 1024)}KB exceeds LLM_IMAGE_MAX_BYTES (${Math.round(
-            maxImageBytes() / 1024
-          )}KB) — the screenshot was dropped to protect the token budget`
-        : undefined
-    };
+      });
+    }
+
+    if (parsed.missing.length) {
+      notes.push(
+        `Batch answer omitted agent(s) ${parsed.missing.join(', ')} — recorded OFFLINE rather than reconstructed. Lower LLM_AGENT_BATCH_SIZE if this repeats.`
+      );
+    }
+
+    return { outputs, failures: [], notes, errorClass: 'NONE', retryAfterMs: 0, provider };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const errorClass = isLlmUnavailable(err) ? err.errorClass : classifyLlmError(message);
     const retryAfterMs = isLlmUnavailable(err) ? err.retryAfterMs : 0;
     const attempts = isLlmUnavailable(err) ? Math.max(1, err.failures.length) : 1;
-    const output = offlineOutput(agentDef, message, errorClass, retryAfterMs);
     return {
-      output,
-      meta: {
-        provider_used: 'none',
-        model_used: 'none',
-        execution_state: 'OFFLINE',
-        error_class: errorClass,
-        attempts,
-        retry_after_ms: retryAfterMs
-      },
-      failures: isLlmUnavailable(err) ? err.failures : []
+      outputs: offlineGroup(group, message, errorClass, retryAfterMs, 'none', attempts),
+      failures: isLlmUnavailable(err) ? err.failures : [],
+      notes,
+      errorClass,
+      retryAfterMs,
+      provider: 'none'
     };
   }
 }
 
+/** Specialists per request. 1 restores the legacy one-call-per-agent behaviour. */
+function batchSize(): number {
+  return Math.max(1, Math.min(envInt('LLM_AGENT_BATCH_SIZE', 5), 10));
+}
+
+/** Seconds a rate-limited run may sit out before retrying the council once. */
+function recoveryWaitMs(): number {
+  return envInt('LLM_RATE_LIMIT_RECOVERY_MS', 75_000);
+}
+
 /**
- * Run the 10 isolated specialists.
+ * Run the 10 specialists.
  *
- * Scheduling rules learned the hard way (one 429 used to zero out the whole
- * council):
- *  - strictly serial by default, with a pacing gap owned by the rate governor;
- *  - the first agent is a *canary* and is patient: it will sit out a
- *    `Retry-After` window so a per-minute free-tier limit recovers mid-run;
- *  - if two agents in a row die for provider reasons, the remaining specialists
- *    are recorded as OFFLINE without a request — preserving quota and, more
- *    importantly, telling the truth about why there is no verdict;
- *  - the whole batch respects LLM_RUN_BUDGET_MS so a run cannot outlive the
- *    serverless `maxDuration` and strand the UI on a spinner.
+ * Scheduling rules, all learned from real "COUNCIL OFFLINE — 10/10" runs:
+ *  - specialists are grouped into batches (LLM_AGENT_BATCH_SIZE, default 5), so a
+ *    full council costs 2 requests instead of 10. This is the primary defence
+ *    against a free-tier 429: the quota is simply never asked for;
+ *  - the screenshot rides on the chart-reading batch only, never on the
+ *    macro/news batch;
+ *  - the first batch is a patient canary: it will sit out a Retry-After window
+ *    so a per-minute limit can reset mid-run;
+ *  - if a whole batch dies for provider reasons and the provider quoted a
+ *    reset that fits the run budget, the batch is retried ONCE after that wait
+ *    instead of writing the run off (this is what turns the old dead end into a
+ *    completed council on free tiers);
+ *  - only after recovery also fails do the remaining batches get skipped —
+ *    recorded OFFLINE, honestly, never as NO_TRADE votes.
  */
 export async function executeAgentBatch(
   payload: SnapshotPayload,
@@ -268,13 +347,12 @@ export async function executeAgentBatch(
   const outputs: Array<AgentOutput & AgentRuntime> = [];
   const failureDetails: LlmFailure[] = [];
   const providersTried = new Set<string>();
-  // 'NONE' until a specialist actually fails — a healthy council must not report
-  // a phantom error class to the judge/UI.
   let dominantErrorClass: LlmErrorClass | 'NONE' = 'NONE';
   let retryAfterMs = 0;
   let consecutiveProviderFailures = 0;
   let lastErrorClass: LlmErrorClass | 'NONE' = 'UNKNOWN';
   let skippedAgents = 0;
+  let recoveryUsed = false;
   const batchWarnings: string[] = [];
 
   const chartBytes = base64Bytes(payload.imageBufferBase64);
@@ -288,68 +366,122 @@ export async function executeAgentBatch(
     );
   }
 
-  for (let index = 0; index < AGENT_DEFINITIONS.length; index++) {
-    const agentDef = AGENT_DEFINITIONS[index];
-    // Macro + news specialists work from frozen feeds; the screenshot adds no
-    // signal there and costs the most tokens — the scarcest budget during a 429.
-    const wantsChart = agentDef.number !== 8 && agentDef.number !== 9;
-    const attachChart = globalAttach && !chartTooBig && wantsChart;
+  const groups = planAgentBatches(AGENT_DEFINITIONS, batchSize());
+  if (groups.length < AGENT_DEFINITIONS.length) {
+    batchWarnings.push(
+      `Council batched into ${groups.length} request(s) instead of ${AGENT_DEFINITIONS.length} (LLM_AGENT_BATCH_SIZE=${batchSize()}) — each specialist still answers independently, but the run costs ${
+        AGENT_DEFINITIONS.length - groups.length
+      } fewer provider requests.`
+    );
+  }
+
+  const record = (group: AgentBatchGroup, result: GroupCallResult, note?: string) => {
+    for (const out of result.outputs) {
+      const finalOut = note ? { ...out, warnings: [...out.warnings, note] } : out;
+      outputs.push(finalOut);
+      const meta: AgentRunMeta = {
+        provider_used: finalOut.provider_used,
+        model_used: finalOut.model_used,
+        execution_state: finalOut.execution_state,
+        error_class: finalOut.error_class,
+        attempts: finalOut.attempts,
+        retry_after_ms: finalOut.retry_after_ms
+      };
+      onProgress?.(finalOut.agent_number, finalOut.execution_state === 'LIVE' ? 'COMPLETED' : 'OFFLINE', finalOut, meta);
+    }
+    void group;
+  };
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    const group = groups[gi];
+    const attachChart = globalAttach && !chartTooBig && group.needsChart;
 
     const tripped = shouldSkipRemainingAgents(consecutiveProviderFailures, lastErrorClass, envInt('LLM_CANARY_FAILURES_TO_TRIP', 2));
     const budgetGone = isRunBudgetExhausted();
     if (tripped.skip || budgetGone) {
       const reason = budgetGone
-        ? `Skipped without a request: LLM run budget (LLM_RUN_BUDGET_MS) exhausted after ${index} agent(s). ${tripped.reason || ''}`.trim()
+        ? `Skipped without a request: LLM run budget (LLM_RUN_BUDGET_MS) exhausted after ${outputs.length} agent(s). ${tripped.reason || ''}`.trim()
         : `Skipped without a request: ${tripped.reason}.`;
       const cls: LlmErrorClass = budgetGone && !tripped.skip ? 'TIMEOUT' : lastErrorClass === 'NONE' ? 'UNKNOWN' : lastErrorClass;
-      const output = offlineOutput(agentDef, reason, cls, retryAfterMs);
-      const meta: AgentRunMeta = {
-        provider_used: 'none',
-        model_used: 'skipped',
-        execution_state: 'OFFLINE',
-        error_class: cls,
-        attempts: 0,
-        retry_after_ms: retryAfterMs
-      };
-      outputs.push({ ...output, ...meta });
-      skippedAgents += 1;
-      onProgress?.(agentDef.number, budgetGone ? 'SKIPPED_BUDGET' : 'SKIPPED_OUTAGE', output, meta);
+      const skipped = offlineGroup(group, reason, cls, retryAfterMs, 'skipped', 0);
+      for (const out of skipped) {
+        outputs.push(out);
+        skippedAgents += 1;
+        onProgress?.(out.agent_number, budgetGone ? 'SKIPPED_BUDGET' : 'SKIPPED_OUTAGE', out, {
+          provider_used: 'none',
+          model_used: 'skipped',
+          execution_state: 'OFFLINE',
+          error_class: cls,
+          attempts: 0,
+          retry_after_ms: retryAfterMs
+        });
+      }
       continue;
     }
 
-    onProgress?.(agentDef.number, 'RUNNING');
-    const canary = index === 0 || consecutiveProviderFailures > 0;
-    const { output, meta, failures, note } = await callSingleAgent(agentDef, payload, {
+    for (const a of group.agents) onProgress?.(a.number, 'RUNNING');
+
+    const patient = gi === 0 || consecutiveProviderFailures > 0;
+    let result = await callAgentGroup(group, payload, {
       attachChart,
-      patient: canary,
+      patient,
       oversizedImageBytes: chartTooBig ? chartBytes : 0
     });
-    failureDetails.push(...failures);
-    if (note && !batchWarnings.includes(note)) batchWarnings.push(note);
 
-    if (meta.execution_state === 'LIVE') {
+    // RECOVERY: the provider told us when it will accept traffic again. If that
+    // window fits inside the run budget, wait it out once instead of declaring
+    // an outage — on free tiers this is the difference between a verdict and
+    // "COUNCIL OFFLINE".
+    const recoverable = result.errorClass === 'RATE_LIMIT' || result.errorClass === 'UPSTREAM' || result.errorClass === 'TIMEOUT';
+    if (recoverable && !recoveryUsed && envBool('LLM_RATE_LIMIT_RECOVERY', true)) {
+      const quoted = result.retryAfterMs > 0 ? result.retryAfterMs : 20_000;
+      const wait = Math.min(quoted + 1_500, recoveryWaitMs());
+      const budget = budgetRemainingMs();
+      if (wait > 0 && wait + 5_000 < budget) {
+        recoveryUsed = true;
+        batchWarnings.push(
+          `Provider asked for ~${Math.ceil(quoted / 1000)}s of backoff; the council waited it out once and retried instead of reporting an outage.`
+        );
+        for (const a of group.agents) onProgress?.(a.number, 'WAITING_RATE_LIMIT');
+        await sleep(wait);
+        resetRateLimits();
+        const retry = await callAgentGroup(group, payload, {
+          attachChart,
+          patient: true,
+          oversizedImageBytes: chartTooBig ? chartBytes : 0
+        });
+        failureDetails.push(...result.failures);
+        result = retry;
+      }
+    }
+
+    failureDetails.push(...result.failures);
+    for (const note of result.notes) if (!batchWarnings.includes(note)) batchWarnings.push(note);
+
+    const anyLive = result.outputs.some((o) => o.execution_state === 'LIVE');
+    if (anyLive) {
       consecutiveProviderFailures = 0;
       lastErrorClass = 'NONE';
     } else {
       consecutiveProviderFailures += 1;
-      lastErrorClass = meta.error_class;
-      dominantErrorClass = meta.error_class;
-      retryAfterMs = Math.max(retryAfterMs, meta.retry_after_ms);
-      providersTried.add(meta.provider_used);
+      lastErrorClass = result.errorClass === 'NONE' ? 'UNKNOWN' : result.errorClass;
+      dominantErrorClass = lastErrorClass;
+      retryAfterMs = Math.max(retryAfterMs, result.retryAfterMs);
+      providersTried.add(result.provider);
     }
 
-    const finalOutput = note ? { ...output, warnings: [...output.warnings, note] } : output;
-    outputs.push({ ...finalOutput, ...meta });
-    onProgress?.(agentDef.number, meta.execution_state === 'LIVE' ? 'COMPLETED' : 'OFFLINE', finalOutput, meta);
+    record(group, result);
 
-    if (index < AGENT_DEFINITIONS.length - 1 && !isRunBudgetExhausted()) {
+    if (gi < groups.length - 1 && !isRunBudgetExhausted()) {
       const gap = envInt('LLM_AGENT_GAP_MS', 1200);
-      if (gap > 0) await new Promise((resolve) => setTimeout(resolve, gap));
+      if (gap > 0) await sleep(gap);
     }
   }
 
-  // Merge what the governor observed directly — the per-agent error text is
-  // useful but the cooldown/budget picture is only visible centrally.
+  // Batches complete out of agent order (chart batch first, macro/news last);
+  // the terminal renders A1..A10, so restore the canonical order here.
+  outputs.sort((a, b) => a.agent_number - b.agent_number);
+
   const gov = snapshot();
   for (const p of gov.providers) {
     providersTried.add(p.provider);

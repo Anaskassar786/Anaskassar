@@ -27,6 +27,31 @@ npm run dev                  # http://localhost:3000 → /dashboard
 
 Never expose API keys to the browser. `.env.local` is gitignored.
 
+### `.env.local` — what you fill (NVIDIA-only council)
+
+Copy `.env.example` then paste **your** keys. Do not commit this file.
+
+```bash
+# REQUIRED — council (vision + 10 agents + debate + judge)
+NVIDIA_API_KEY=nvapi-YOUR_KEY_HERE
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+NVIDIA_DEFAULT_MODEL=minimaxai/minimax-m3
+LLM_PROVIDER_ORDER=nvidia
+LLM_MAX_TOKENS=4096
+
+# REQUIRED for live market freeze (otherwise DATA_UNAVAILABLE on that feed)
+TWELVE_DATA_API_KEY=YOUR_TWELVE_DATA_KEY
+TWELVE_DATA_BASE_URL=https://api.twelvedata.com
+FRED_API_KEY=YOUR_FRED_KEY
+FRED_BASE_URL=https://api.stlouisfed.org/fred
+NEWS_API_KEY=YOUR_NEWSAPI_KEY
+NEWS_API_BASE_URL=https://newsapi.org
+
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
+
+Leave `OPENROUTER_API_KEY` and `GEMINI_API_KEY` **empty**. They are not called while `LLM_PROVIDER_ORDER=nvidia`.
+
 ## Environment variables (`.env.local`)
 
 All keys are **server-side only** — nothing is `NEXT_PUBLIC_*` except `NEXT_PUBLIC_APP_URL`.
